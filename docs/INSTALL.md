@@ -33,6 +33,24 @@ before this script: it intentionally requires a fresh system.
 
 ## 2. Clone and review
 
+For the current private repository, first authorize GitHub on the Pi using your
+own maintenance account (not root):
+
+```sh
+sudo apt-get update
+sudo apt-get install -y git gh
+gh auth login --hostname github.com --git-protocol https --web
+gh auth setup-git
+```
+
+Follow the displayed browser/device-code instructions from your computer or
+phone and approve the intended GitHub account. Do not send the device code,
+token or password to anyone. On a headless Pi without a keyring, GitHub CLI may
+store its credential in that Linux account's configuration; protect the account
+and never copy that credential into the repository.
+
+Then clone normally:
+
 ```sh
 sudo apt-get update
 sudo apt-get install -y git
@@ -44,8 +62,17 @@ ip -br address
 systemctl is-active NetworkManager
 ```
 
-For a private repository, authenticate with your own GitHub credential/SSH key.
-Never put an access token in the clone URL or commit it into this project.
+If you already use an authorized SSH key, an SSH clone is an alternative:
+`git clone git@github.com:atworkshop55-hash/Gatekeeper-server-pi-apponlyQR.git`.
+An unattended pull-only server can use a separate read-only repository deploy
+key, configured by the repository owner. Never copy a developer's private key
+onto the Pi. Never put an access token in the clone URL or commit it into this
+project. Do not use the GitHub account password for HTTPS Git authentication.
+
+`could not read Username for 'https://github.com'` means Git authentication is
+missing in that Linux account; it is not an installer failure. Run the
+authorization steps above, then retry the clone. Keeping the repository private
+is supported; making it public is not necessary.
 
 ## 3. Run the fresh installer
 

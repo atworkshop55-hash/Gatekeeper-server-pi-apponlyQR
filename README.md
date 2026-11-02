@@ -23,6 +23,9 @@ The Flutter tablet app is a separate project.
 3. [What was done, verification and remaining acceptance](docs/HANDOVER.md).
 4. [Pull changes, amend flows, maintain and back up](docs/MAINTENANCE.md).
 
+For the private repository, complete the [GitHub authentication step](docs/INSTALL.md#2-clone-and-review)
+on the Pi before cloning.
+
 ```sh
 sudo apt-get update
 sudo apt-get install -y git
