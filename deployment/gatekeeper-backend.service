@@ -1,0 +1,22 @@
+[Unit]
+Description=Gate Keeper app-only backend foundation
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+User=gatekeeper
+Group=gatekeeper
+WorkingDirectory=/var/lib/gatekeeper
+ExecStart=/usr/bin/node /opt/gatekeeper-backend/node_modules/node-red/red.js --userDir /var/lib/gatekeeper --settings /etc/gatekeeper/settings.js
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gatekeeper
+
+[Install]
+WantedBy=multi-user.target

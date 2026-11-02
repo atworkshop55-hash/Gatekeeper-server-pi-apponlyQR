@@ -1,0 +1,21 @@
+[Unit]
+Description=GateKeeper mapped management-network recovery monitor
+After=NetworkManager.service
+Requires=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+Group=gatekeeper
+ExecStart=/usr/bin/python3 -B /opt/gatekeeper-network/revpi-management monitor
+UMask=0077
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/gatekeeper-management /run/lock
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET
+
+[Install]
+WantedBy=multi-user.target

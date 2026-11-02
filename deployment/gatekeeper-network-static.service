@@ -1,0 +1,23 @@
+[Unit]
+Description=Gate Keeper restricted static gate-network service
+After=NetworkManager.service
+Requires=NetworkManager.service
+
+[Service]
+Type=simple
+User=root
+Group=gatekeeper
+ExecStart=/usr/bin/python3 -B /opt/gatekeeper-network/gatekeeper-network-service
+RuntimeDirectory=gatekeeper-network
+RuntimeDirectoryMode=0750
+UMask=0077
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/run/lock
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

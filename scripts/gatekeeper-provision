@@ -1,0 +1,416 @@
+#!/usr/bin/python3
+"""Prepare/test fresh TLS and SQLite, then explicitly install on the spare Pi."""
+
+import argparse
+import grp
+import hashlib
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import shutil
+import socket
+import sqlite3
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+
+MANAGER = "gatekeeper_dynsec_manager"
+ROLE = "gatekeeper_dynsec_manager"
+CONFIG = Path("/etc/mosquitto/mosquitto.conf")
+EXPECTED_CONFIG = """pid_file /run/mosquitto/mosquitto.pid
+user mosquitto
+persistence true
+persistence_location /var/lib/mosquitto/
+log_dest syslog
+listener 1883 127.0.0.1
+allow_anonymous true
+"""
+
+
+def run(*args, input=None):
+    result = subprocess.run(args, input=input, capture_output=True, text=True, timeout=90)
+    if result.returncode:
+        # Generated passwords are passed through stdin only; no arbitrary output echoed.
+        raise RuntimeError(f"{args[0]} failed (exit {result.returncode}); inspect stage locally.")
+    return result.stdout
+
+
+def validate_host(host):
+    host = host.lower()
+    if len(host) > 253 or not all(re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in host.split(".")):
+        raise ValueError("Enter a DNS hostname without scheme, port or certificate syntax.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    raise ValueError("This stage uses a DNS identity; an IP needs a separate explicit profile.")
+
+
+def restricted_security(initial):
+    client = initial["clients"][0]
+    required = ("password", "salt", "iterations")
+    if not all(key in client for key in required):
+        raise ValueError("Unsupported Dynamic Security credential format.")
+    return {
+        "clients": [{"username": MANAGER, **{key: client[key] for key in required},
+                     "roles": [{"rolename": ROLE, "priority": 0}]}],
+        "roles": [{"rolename": ROLE, "acls": [
+            {"acltype": "publishClientSend", "topic": "$CONTROL/dynamic-security/v1",
+             "priority": 0, "allow": True},
+            {"acltype": "subscribeLiteral", "topic": "$CONTROL/dynamic-security/v1/response",
+             "priority": 0, "allow": True},
+            {"acltype": "publishClientReceive", "topic": "$CONTROL/dynamic-security/v1/response",
+             "priority": 0, "allow": True},
+        ]}],
+        "defaultACLAccess": {"publishClientSend": False, "publishClientReceive": False,
+                             "subscribe": False, "unsubscribe": True},
+    }
+
+
+def database_module():
+    path = Path(__file__).with_name("gatekeeper-install")
+    loader = importlib.machinery.SourceFileLoader("gatekeeper_database_setup", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def prepare(root, host):
+    host = validate_host(host)
+    if any(root.iterdir()):
+        raise ValueError("Provisioning staging directory must be empty.")
+    os.chmod(root, 0o700)
+    for name in ("ca", "tls"):
+        (root / name).mkdir(mode=0o700)
+    ca = root / "ca"
+    tls = root / "tls"
+    run("openssl", "req", "-x509", "-newkey", "rsa:3072", "-nodes",
+        "-keyout", str(ca / "ca.key"), "-out", str(tls / "ca.crt"),
+        "-days", "3650", "-sha256", "-subj", "/CN=Gate Keeper Site CA",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    run("openssl", "req", "-new", "-newkey", "rsa:3072", "-nodes",
+        "-keyout", str(tls / "server.key"), "-out", str(root / "server.csr"),
+        "-subj", f"/CN={host}")
+    extension = root / "server.ext"
+    extension.write_text(f"basicConstraints=critical,CA:FALSE\n"
+                         f"keyUsage=critical,digitalSignature,keyEncipherment\n"
+                         f"extendedKeyUsage=serverAuth\nsubjectAltName=DNS:{host}\n")
+    run("openssl", "x509", "-req", "-in", str(root / "server.csr"),
+        "-CA", str(tls / "ca.crt"), "-CAkey", str(ca / "ca.key"),
+        "-CAcreateserial", "-out", str(tls / "server.crt"), "-days", "825",
+        "-sha256", "-extfile", str(extension))
+    run("openssl", "verify", "-CAfile", str(tls / "ca.crt"),
+        "-verify_hostname", host, str(tls / "server.crt"))
+    password = secrets.token_hex(32)
+    initial = root / "initial-security.json"
+    run("mosquitto_ctrl", "dynsec", "init", str(initial), "temporary_setup",
+        input=password + "\n" + password + "\n")
+    (root / "dynamic-security.json").write_text(
+        json.dumps(restricted_security(json.loads(initial.read_text())), indent=2) + "\n")
+    initial.unlink()
+    (root / "manager-password").write_text(password + "\n")
+    db = sqlite3.connect(root / "system.db")
+    try:
+        report = database_module().prepare_database(db)
+    finally:
+        db.close()
+    for path in root.rglob("*"):
+        if path.is_file():
+            path.chmod(0o600)
+    report.update(broker_host=host, tls_port=8883, app_flows_active=False,
+                  admin_created=False, tablet_registered=False,
+                  ca_sha256=hashlib.sha256((tls / "ca.crt").read_bytes()).hexdigest())
+    (root / "provisioning.json").write_text(json.dumps(report, indent=2) + "\n")
+    (root / "provisioning.json").chmod(0o600)
+    return report
+
+
+def broker_config(tls, security, plugin, loopback=False, port=8883):
+    return (
+        "per_listener_settings true\nlog_type error\nlog_type warning\n"
+        + ("" if loopback else
+           "pid_file /run/mosquitto/mosquitto.pid\nuser mosquitto\n"
+           "persistence true\npersistence_location /var/lib/mosquitto/\nlog_dest syslog\n"
+           "listener 1883 127.0.0.1\nallow_anonymous true\n")
+        + f"listener {port} {'127.0.0.1' if loopback else '0.0.0.0'}\n"
+        "allow_anonymous false\n"
+        f"cafile {tls / 'ca.crt'}\ncertfile {tls / 'server.crt'}\nkeyfile {tls / 'server.key'}\n"
+        f"plugin {plugin}\nplugin_opt_config_file {security}\n"
+    )
+
+
+def anonymous_connack(host, port, ca, address="127.0.0.1"):
+    context = ssl.create_default_context(cafile=str(ca))
+    with socket.create_connection((address, port), timeout=5) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as stream:
+            # MQTT 3.1.1 CONNECT, clean session, no username/password.
+            stream.sendall(b"\x10\x11\x00\x04MQTT\x04\x02\x00\x0a\x00\x05probe")
+            response = b""
+            while len(response) < 4:
+                part = stream.recv(4 - len(response))
+                if not part:
+                    raise ValueError("Broker closed without a complete CONNACK.")
+                response += part
+            if response[:3] != b"\x20\x02\x00" or response[3] != 5:
+                raise ValueError("Anonymous TLS connection was not explicitly refused.")
+
+
+def mqtt_string(value):
+    data = value.encode()
+    return len(data).to_bytes(2, "big") + data
+
+
+def packet(kind, payload):
+    length = len(payload)
+    encoded = bytearray()
+    while True:
+        digit = length % 128
+        length //= 128
+        encoded.append(digit | (128 if length else 0))
+        if not length:
+            break
+    return bytes([kind]) + encoded + payload
+
+
+def receive_packet(stream, max_length=4096):
+    def exact(count):
+        result = b""
+        while len(result) < count:
+            part = stream.recv(count - len(result))
+            if not part:
+                raise ValueError("Incomplete MQTT response.")
+            result += part
+        return result
+    kind = exact(1)[0]
+    length = 0
+    for index in range(4):
+        digit = exact(1)[0]
+        length += (digit & 127) * 128 ** index
+        if not digit & 128:
+            if length > max_length:
+                raise ValueError("Unexpectedly large MQTT response.")
+            return kind, exact(length)
+    raise ValueError("Invalid MQTT response length.")
+
+
+def manager_check(host, port, ca, password):
+    context = ssl.create_default_context(cafile=str(ca))
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
+        with context.wrap_socket(raw, server_hostname=host) as stream:
+            payload = b"\x00\x04MQTT\x04\xc2\x00\x0a" + mqtt_string("manager_probe")
+            payload += mqtt_string(MANAGER) + mqtt_string(password)
+            stream.sendall(packet(0x10, payload))
+            if receive_packet(stream) != (0x20, b"\x00\x00"):
+                raise ValueError("Restricted manager authentication failed.")
+            for identifier, topic, expected in (
+                (1, "$CONTROL/dynamic-security/v1/response", 0),
+                (2, "system/state", 128),
+                (3, "#", 128),
+            ):
+                stream.sendall(packet(0x82, identifier.to_bytes(2, "big")
+                                      + mqtt_string(topic) + b"\x00"))
+                if receive_packet(stream) != (0x90, identifier.to_bytes(2, "big") + bytes([expected])):
+                    raise ValueError("Manager subscription ACL verification failed.")
+            stream.sendall(b"\xe0\x00")
+
+
+def rehearsal(host, plugin):
+    with tempfile.TemporaryDirectory(prefix="gatekeeper-tls-rehearsal-") as directory:
+        root = Path(directory)
+        report = prepare(root, host)
+        with socket.socket() as reserve:
+            reserve.bind(("127.0.0.1", 0))
+            port = reserve.getsockname()[1]
+        config = root / "broker.conf"
+        config.write_text(broker_config(root / "tls", root / "dynamic-security.json",
+                                       plugin, True, port))
+        with (root / "broker.log").open("w") as log:
+            process = subprocess.Popen(["/usr/sbin/mosquitto", "-c", str(config)], stdout=log, stderr=log)
+            try:
+                time.sleep(1)
+                if process.poll() is not None:
+                    raise RuntimeError("Isolated broker did not start.")
+                anonymous_connack(host, port, root / "tls/ca.crt")
+                manager_check(host, port, root / "tls/ca.crt",
+                              (root / "manager-password").read_text().strip())
+                try:
+                    anonymous_connack("wrong-host.invalid", port, root / "tls/ca.crt")
+                except ssl.SSLCertVerificationError:
+                    pass
+                else:
+                    raise ValueError("Wrong-hostname verification unexpectedly succeeded.")
+                report.update(tls_hostname_verified=True, wrong_hostname_rejected=True,
+                              anonymous_tls_rejected=True, manager_auth_acl_verified=True,
+                              temporary_files_removed_on_exit=True)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+        return report
+
+
+def install(host, plugin):
+    if os.geteuid() != 0:
+        raise ValueError("Run the reviewed provisioning command locally with sudo.")
+    os_release = Path("/etc/os-release").read_text()
+    model = Path("/proc/device-tree/model").read_text().strip("\0")
+    if not model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")) or (
+            'VERSION_ID="13"' not in os_release) or Path("/dev/piControl0").exists():
+        raise ValueError("Fresh Raspberry Pi Trixie target required; working RevPi excluded.")
+    if CONFIG.is_symlink() or CONFIG.read_text() != EXPECTED_CONFIG:
+        raise ValueError("Broker configuration is not the known foundation; review before modification.")
+    root = Path("/etc/gatekeeper")
+    foundation = json.loads(Path("/var/lib/gatekeeper/flows.json").read_text())
+    if [node.get("type") for node in foundation] != ["tab", "inject"] or (
+            foundation[1].get("wires") != [[]] or foundation[1].get("repeat") != "60"):
+        raise ValueError("Only the idle foundation may be active during fresh provisioning.")
+    destinations = (root / "ca", Path("/etc/mosquitto/gatekeeper-tls"),
+                    Path("/var/lib/mosquitto/gatekeeper-dynamic-security.json"),
+                    root / "manager-password", root / "provisioning.json",
+                    Path("/var/lib/gatekeeper/system.db"), root / "broker-ca.crt")
+    if any(path.exists() or path.is_symlink() for path in destinations):
+        raise ValueError("Provisioning output already exists; preserving keys/data. Resume requires review.")
+    if run("systemctl", "is-active", "gatekeeper-backend.service").strip() != "active":
+        raise ValueError("Headless foundation must be active.")
+    if input(f"Type {host} to provision new TLS identity and empty database: ").strip().lower() != host:
+        raise ValueError("Cancelled.")
+    gatekeeper = pwd.getpwnam("gatekeeper")
+    mosquitto = pwd.getpwnam("mosquitto")
+    backup = CONFIG.with_name(f"mosquitto.conf.gatekeeper-tls-{time.time_ns()}.bak")
+    with tempfile.TemporaryDirectory(prefix=".tls-stage-", dir=root) as directory:
+        stage = Path(directory)
+        report = prepare(stage, host)
+        shutil.copyfile(CONFIG, backup)
+        backup.chmod(0o600)
+        run("systemctl", "stop", "mosquitto.service")
+        try:
+            shutil.copytree(stage / "ca", destinations[0])
+            shutil.copytree(stage / "tls", destinations[1])
+            os.chown(destinations[1], 0, mosquitto.pw_gid)
+            destinations[1].chmod(0o750)
+            for path in destinations[1].iterdir():
+                os.chown(path, 0, mosquitto.pw_gid)
+                path.chmod(0o640)
+            for source, target, uid, gid, mode in (
+                ("dynamic-security.json", destinations[2], mosquitto.pw_uid, mosquitto.pw_gid, 0o600),
+                ("manager-password", destinations[3], 0, gatekeeper.pw_gid, 0o640),
+                ("provisioning.json", destinations[4], 0, gatekeeper.pw_gid, 0o640),
+                ("system.db", destinations[5], gatekeeper.pw_uid, gatekeeper.pw_gid, 0o600),
+            ):
+                shutil.copyfile(stage / source, target)
+                os.chown(target, uid, gid)
+                target.chmod(mode)
+            # Only public CA is copied for the application backend.
+            ca = root / "broker-ca.crt"
+            shutil.copyfile(stage / "tls/ca.crt", ca)
+            os.chown(ca, 0, gatekeeper.pw_gid)
+            ca.chmod(0o640)
+            new_config = CONFIG.with_name(".gatekeeper-tls.conf")
+            new_config.write_text(broker_config(destinations[1], destinations[2], plugin))
+            os.chown(new_config, 0, 0)
+            new_config.chmod(0o644)
+            os.replace(new_config, CONFIG)
+            run("systemctl", "start", "mosquitto.service")
+            time.sleep(1)
+            run("systemctl", "is-active", "mosquitto.service")
+            anonymous_connack(host, 8883, ca)
+            manager_check(host, 8883, ca, destinations[3].read_text().strip())
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
+            run("systemctl", "stop", "mosquitto.service")
+            shutil.copyfile(backup, CONFIG)
+            CONFIG.chmod(0o644)
+            run("systemctl", "start", "mosquitto.service")
+            raise RuntimeError(
+                f"Provisioning failed; original broker restored from {backup}. "
+                "Generated identity/data preserved for review; do not rerun or delete blindly.") from None
+    return dict(report, broker_backup=str(backup), anonymous_tls_rejected=True,
+                manager_auth_acl_verified=True,
+                note="TLS ready, no tablet accounts or active app flows; local enrollment integration pending.")
+
+
+def protect_broker_logs(host):
+    if os.geteuid() != 0 or not sys.stdin.isatty():
+        raise ValueError("Authenticated local sudo terminal required.")
+    meta = json.loads(Path("/etc/gatekeeper/provisioning.json").read_text())
+    if meta["broker_host"] != host:
+        raise ValueError("Provisioned broker identity does not match.")
+    if CONFIG.is_symlink() or not CONFIG.is_file() or CONFIG.stat().st_uid != 0:
+        raise ValueError("Unsafe broker configuration.")
+    original = CONFIG.read_text()
+    if "plugin_opt_config_file /var/lib/mosquitto/gatekeeper-dynamic-security.json" not in original:
+        raise ValueError("Expected Gate Keeper broker configuration.")
+    if any(line.strip().startswith("include_dir ") for line in original.splitlines()):
+        raise ValueError("Included broker configuration requires separate logging review.")
+    if input("Type PROTECT-BROKER-LOGS to restrict broker logs without changing accounts: ").strip() != "PROTECT-BROKER-LOGS":
+        raise ValueError("Cancelled.")
+    updated = "\n".join(line for line in original.splitlines()
+                        if not line.strip().startswith("log_type ")) + "\nlog_type error\nlog_type warning\n"
+    backup = CONFIG.with_name(f"mosquitto.conf.gatekeeper-logs-{time.time_ns()}.bak")
+    shutil.copyfile(CONFIG, backup)
+    backup.chmod(0o600)
+    with tempfile.NamedTemporaryFile(mode="w", dir=CONFIG.parent, prefix=".gatekeeper-logs-",
+                                     delete=False) as output:
+        temporary = Path(output.name)
+        output.write(updated)
+    try:
+        temporary.chmod(0o644)
+        os.replace(temporary, CONFIG)
+        try:
+            run("systemctl", "restart", "mosquitto.service")
+            run("systemctl", "is-active", "mosquitto.service")
+        except (OSError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt):
+            shutil.copyfile(backup, CONFIG)
+            CONFIG.chmod(0o644)
+            run("systemctl", "restart", "mosquitto.service")
+            raise RuntimeError(f"Log protection failed; broker configuration restored from {backup}.") from None
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {"broker_logs": "error and warning only; no informational Dynamic Security credential logs",
+            "backup": str(backup), "accounts_and_certificates": "unchanged"}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--install", action="store_true", help="Local-sudo explicitly confirmed fresh provisioning.")
+    mode.add_argument("--protect-broker-logs", action="store_true",
+                      help="Confirmed logging-only update; preserve installed broker identities and database.")
+    args = parser.parse_args()
+    try:
+        host = validate_host(args.host)
+        plugins = list(Path("/usr/lib").glob("*/mosquitto_dynamic_security.so"))
+        if len(plugins) != 1:
+            raise ValueError("Exactly one installed Dynamic Security plugin required.")
+        if args.protect_broker_logs:
+            report = protect_broker_logs(host)
+        elif args.install:
+            report = install(host, plugins[0])
+        else:
+            report = rehearsal(host, plugins[0])
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, EOFError) as error:
+        parser.exit(2, f"Provisioning failed: {error}\n")
+    except KeyboardInterrupt:
+        parser.exit(130, "Provisioning cancelled. Inspect reported output before retrying.\n")
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == "__main__":
+    main()

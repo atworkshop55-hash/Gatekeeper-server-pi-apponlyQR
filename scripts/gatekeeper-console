@@ -1,0 +1,178 @@
+#!/usr/bin/python3
+"""Local, login-protected console prototype; cannot issue enrollment credentials."""
+
+import curses
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+
+TEST_PAYLOAD = "Gate Keeper DISPLAY TEST ONLY"
+TEST_SECONDS = 60
+
+
+def require_local_console():
+    if os.geteuid() == 0:
+        raise ValueError("Run as the logged-in maintenance user, not root or sudo.")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("A local authenticated Linux console is required.")
+    if not re.fullmatch(r"/dev/tty[1-9][0-9]*", os.ttyname(sys.stdin.fileno())):
+        raise ValueError("Use the HDMI Linux console, not SSH, a desktop terminal or redirected input.")
+    if os.ttyname(sys.stdin.fileno()) != os.ttyname(sys.stdout.fileno()):
+        raise ValueError("Input and output must use the same local console.")
+
+
+def parse_xpm(value):
+    lines = re.findall(r'^\s*"([^"]*)"\s*,?\s*$', value, re.MULTILINE)
+    if not lines:
+        raise ValueError("QR encoder returned no XPM image.")
+    header = lines[0].split()
+    if len(header) != 4:
+        raise ValueError("Unsupported QR image header.")
+    width, height, colors, characters = map(int, header)
+    if not 1 <= width <= 177 or width != height or colors != 2 or characters != 1:
+        raise ValueError("Unsupported QR dimensions or palette.")
+    if len(lines) != 1 + colors + height:
+        raise ValueError("Incomplete QR image.")
+    palette = {}
+    for line in lines[1:3]:
+        match = re.fullmatch(r"(.)\s+c\s+(#[0-9a-fA-F]{6})", line)
+        if not match or match[2].lower() not in ("#000000", "#ffffff"):
+            raise ValueError("QR palette must be black and white.")
+        palette[match[1]] = match[2].lower() == "#000000"
+    if len(palette) != 2 or set(palette.values()) != {False, True}:
+        raise ValueError("Invalid QR palette.")
+    matrix = []
+    for row in lines[3:]:
+        if len(row) != width or any(pixel not in palette for pixel in row):
+            raise ValueError("Invalid QR image row.")
+        matrix.append([palette[pixel] for pixel in row])
+    # Add the quiet zone ourselves, independent of encoder settings.
+    white = [False] * (width + 8)
+    return [white[:] for _ in range(4)] + [
+        [False] * 4 + row + [False] * 4 for row in matrix
+    ] + [white[:] for _ in range(4)]
+
+
+def display_test_matrix():
+    executable = shutil.which("qrencode")
+    if not executable:
+        raise ValueError("qrencode is missing. Install it locally with: sudo apt install qrencode")
+    result = subprocess.run(
+        [executable, "-t", "XPM", "-s", "1", "-m", "0", "-l", "M", "-o", "-"],
+        input=TEST_PAYLOAD, capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise ValueError(f"Local QR encoder failed (exit {result.returncode}); inspect qrencode locally.")
+    return parse_xpm(result.stdout)
+
+
+def status_lines():
+    lines = ["Read-only status; server deployment and real enrollment are not installed by this screen."]
+    for path in sorted(Path("/sys/class/drm").glob("card*-HDMI-A-*")):
+        lines.append(f"{path.name}: {(path / 'status').read_text().strip()}")
+    for path in sorted(Path("/sys/class/net").iterdir()):
+        if (path / "device").exists() and not (path / "wireless").exists():
+            lines.append(f"{path.name}: {(path / 'operstate').read_text().strip()}")
+    return lines
+
+
+def text(screen, y, value, attribute=0):
+    height, width = screen.getmaxyx()
+    if y < height - 1 and width > 2:
+        screen.addnstr(y, 1, value, width - 2, attribute)
+
+
+def message(screen, title, lines):
+    screen.erase()
+    text(screen, 1, title, curses.A_BOLD)
+    for y, line in enumerate(lines, 3):
+        text(screen, y, line)
+    text(screen, screen.getmaxyx()[0] - 2, "Press any key to return.")
+    screen.refresh()
+    screen.timeout(-1)
+    screen.getch()
+
+
+def show_test(screen):
+    matrix = display_test_matrix()
+    height, width = screen.getmaxyx()
+    if height < len(matrix) + 6 or width < len(matrix) * 2 + 4:
+        raise ValueError(
+            f"Console too small: need {len(matrix) * 2 + 4} columns x {len(matrix) + 6} rows. "
+            "Use a smaller console font or larger supported display mode.")
+    if not curses.has_colors():
+        raise ValueError("A color-capable Linux console is required for reliable black/white QR rendering.")
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_BLACK)
+    screen.erase()
+    text(screen, 0, "DISPLAY TEST ONLY - cannot enroll a tablet", curses.A_BOLD)
+    left = (width - len(matrix) * 2) // 2
+    for y, row in enumerate(matrix, 2):
+        for x, black in enumerate(row):
+            screen.addstr(y, left + x * 2, "  ", curses.color_pair(2 if black else 1))
+    deadline = time.monotonic() + TEST_SECONDS
+    screen.timeout(200)
+    try:
+        while time.monotonic() < deadline:
+            text(screen, len(matrix) + 3,
+                 f"Clears in {max(0, int(deadline - time.monotonic()))} seconds. Any key cancels.   ")
+            screen.refresh()
+            if screen.getch() != -1:
+                break
+    finally:
+        screen.erase()
+        screen.refresh()
+        screen.timeout(-1)
+
+
+def menu(screen):
+    screen.keypad(True)
+    while True:
+        screen.erase()
+        text(screen, 1, "Gate Keeper - local commissioning prototype", curses.A_BOLD)
+        text(screen, 3, "Normal Linux login retained. No credentials or system settings are changed.")
+        text(screen, 5, "1  System/display status")
+        text(screen, 6, "2  QR DISPLAY TEST ONLY (not enrollment)")
+        text(screen, 7, "3  First-tablet enrollment (unavailable until backend integration)")
+        text(screen, 9, "Q  Exit to your authenticated shell")
+        screen.refresh()
+        key = screen.getch()
+        if key in (ord("q"), ord("Q")):
+            screen.erase()
+            screen.refresh()
+            return
+        try:
+            if key == ord("1"):
+                message(screen, "System/display status", status_lines())
+            elif key == ord("2"):
+                show_test(screen)
+            elif key == ord("3"):
+                message(screen, "Enrollment unavailable", [
+                    "No broker/Node-RED enrollment integration is configured on this screen.",
+                    "No device was registered and no bootstrap account was created.",
+                    "Install and verify the backend before enabling real enrollment.",
+                ])
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            message(screen, "Setup action failed", [str(error)])
+
+
+def main():
+    try:
+        require_local_console()
+        curses.wrapper(menu)
+    except (OSError, ValueError, curses.error) as error:
+        print(f"Gate Keeper console failed: {error}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("Gate Keeper console cancelled; no enrollment or settings changed.")
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

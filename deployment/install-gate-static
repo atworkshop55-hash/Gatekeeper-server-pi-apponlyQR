@@ -1,0 +1,62 @@
+#!/usr/bin/python3
+"""Confirmed static-only isolated gate link test; no app or DHCP activation."""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import gatekeeper_interfaces as interfaces
+
+loader = importlib.machinery.SourceFileLoader(
+    "gate_static_helper", str(Path(__file__).resolve().parent.parent / "scripts" / "revpi-network"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+network = importlib.util.module_from_spec(spec)
+loader.exec_module(network)
+
+
+def main():
+    if os.geteuid() != 0 or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Authenticated local sudo terminal required.")
+    model = Path("/proc/device-tree/model").read_text().strip("\0")
+    if not model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")) or Path("/dev/piControl0").exists():
+        raise ValueError("Spare Raspberry Pi only; working RevPi excluded.")
+    value = interfaces.read_mapping()
+    if value is None:
+        raise ValueError("Confirm physical Ethernet roles first.")
+    roles = interfaces.resolved_roles(value, interfaces.inventory())
+    if network.CONF.exists() or network.CONF.is_symlink():
+        raise ValueError("Existing gate DHCP configuration requires review; not changed by this static test.")
+    result = subprocess.run(["systemctl", "is-active", "dnsmasq"], capture_output=True, text=True, timeout=10)
+    if result.stdout.strip() not in ("inactive", "failed", "unknown"):
+        raise ValueError("DHCP service status is not safely inactive; review before static-only testing.")
+    address = input("Unused static Pi gate address (no prefix): ").strip()
+    config = {"interface": "lan1", "masterMode": "client", "clientMode": "static", "staticIp": address}
+    network.validate(config)
+    before = network.run("ip", "-j", "-4", "route", "show", "default")
+    print(f"Change only {roles['gate']} to {address}/24; management {roles['management']} unchanged.")
+    print("No DHCP server, default gateway, app network handlers, sudo rules or gate controls enabled.")
+    if input("Type APPLY-STATIC-GATE-LINK: ").strip() != "APPLY-STATIC-GATE-LINK":
+        raise ValueError("Cancelled.")
+    import fcntl
+    with open("/run/lock/gatekeeper-network.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = network.apply(config)
+    print(json.dumps(result))
+    after = network.run("ip", "-j", "-4", "route", "show", "default")
+    if json.loads(before) != json.loads(after):
+        raise RuntimeError("Default route changed unexpectedly; inspect management locally before continuing.")
+    print("Static gate link active; default routes unchanged. Test board connectivity next.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)

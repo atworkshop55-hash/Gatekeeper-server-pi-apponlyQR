@@ -1,0 +1,19 @@
+[
+  {
+    "id": "gatekeeper_foundation",
+    "type": "tab",
+    "label": "Uncommissioned backend foundation",
+    "disabled": false
+  },
+  {
+    "id": "gatekeeper_foundation_tick",
+    "type": "inject",
+    "z": "gatekeeper_foundation",
+    "name": "Idle timer - no outputs or gate actions",
+    "props": [],
+    "repeat": "60",
+    "once": false,
+    "onceDelay": 0.1,
+    "wires": [[]]
+  }
+]

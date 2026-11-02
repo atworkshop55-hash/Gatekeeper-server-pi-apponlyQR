@@ -1,0 +1,230 @@
+#!/usr/bin/python3
+"""Authorized local HDMI enrollment display; bootstrap payload never printed."""
+
+import argparse
+import ctypes
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import mmap
+import os
+from pathlib import Path
+import select
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+
+def console_module():
+    loader = importlib.machinery.SourceFileLoader(
+        "gatekeeper_qr_console", str(Path(__file__).with_name("gatekeeper-console")))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def read_record(stream, buffer):
+    while b"\n" not in buffer:
+        chunk = stream.recv(8192)
+        if not chunk:
+            raise ValueError("Local enrollment service disconnected.")
+        buffer += chunk
+        if len(buffer) > 65536:
+            raise ValueError("Oversized local enrollment response.")
+    line, buffer = buffer.split(b"\n", 1)
+    return json.loads(line), buffer
+
+
+def pixel(value, offsets, bits=32):
+    number = 0
+    for offset, length in offsets:
+        number |= (((1 << length) - 1) if value else 0) << offset
+    return number.to_bytes(bits // 8, "little")
+
+
+def sudo_console_origin():
+    parent = os.getppid()
+    for _ in range(4):
+        process = Path("/proc") / str(parent)
+        if process.stat().st_uid != 0 or str((process / "exe").resolve()) not in (
+                "/usr/bin/sudo", "/bin/sudo"):
+            return False
+        fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        device = int(fields[4]) & 0xffffffff
+        if os.major(device) == 4 and 1 <= os.minor(device) <= 63:
+            return True
+        parent = int(fields[1])
+    return False
+
+
+def require_local_console():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Authenticated HDMI Linux console required, not SSH.")
+    terminal = os.ttyname(sys.stdin.fileno())
+    if terminal.startswith("/dev/tty") and terminal[8:].isdigit() and 1 <= int(terminal[8:]) <= 63:
+        return
+    # Trixie sudo may allocate a PTY; trust its root-owned console ancestry, not environment variables.
+    if terminal.startswith("/dev/pts/") and terminal[9:].isdigit() and sudo_console_origin():
+        return
+    raise ValueError("Authenticated HDMI Linux console required, not SSH.")
+
+
+def enrollment_status():
+    security = json.loads(Path("/var/lib/mosquitto/gatekeeper-dynamic-security.json").read_text())
+    accounts = security["clients"]
+    with sqlite3.connect("file:/var/lib/gatekeeper/system.db?mode=ro", uri=True) as database:
+        administrators = database.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0]
+        gates = database.execute("SELECT COUNT(*) FROM gates").fetchone()[0]
+        audits = dict(database.execute("SELECT type, COUNT(*) FROM audit_logs GROUP BY type").fetchall())
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        client.connect("/var/lib/gatekeeper/commissioning.sock")
+        client.sendall(b'{"action":"status"}\n')
+        ready, _ = read_record(client, b"")
+    return {"enrollment_ready": ready.get("ready") is True,
+            "app_login_ready": ready.get("loginReady") is True,
+            "app_user_settings_writes_ready": ready.get("writesReady") is True,
+            "application_administrators": administrators,
+            "permanent_tablet_accounts": sum(str(c["username"]).startswith("tablet_") for c in accounts),
+            "bootstrap_accounts_remaining": sum(str(c["username"]).startswith("enroll_") for c in accounts),
+            "configured_gates": gates, "audit_counts_by_type": audits}
+
+
+def framebuffer_matrix(matrix):
+    require_local_console()
+    fd = os.open("/dev/fb0", os.O_RDWR)
+    try:
+        variable = fcntl.ioctl(fd, 0x4600, bytes(160))
+        fixed = fcntl.ioctl(fd, 0x4602, bytes(80))
+        width, height, virtual_width, virtual_height, xoff, yoff, bits = struct.unpack_from(
+            "<7I", variable)
+        if ctypes.sizeof(ctypes.c_ulong) != 8 or bits not in (16, 32) or xoff != 0 or yoff != 0:
+            raise ValueError("This renderer supports arm64 16/32-bit framebuffer at zero offset only.")
+        length = struct.unpack_from("<I", fixed, 24)[0]
+        stride = struct.unpack_from("<I", fixed, 48)[0]
+        bytes_per_pixel = bits // 8
+        if (width <= 0 or height <= 0 or virtual_width < width or virtual_height < height or
+                stride < width * bytes_per_pixel or stride * height > length or
+                stride % bytes_per_pixel):
+            raise ValueError("Unexpected framebuffer geometry.")
+        channels = [(struct.unpack_from("<I", variable, base)[0],
+                     struct.unpack_from("<I", variable, base + 4)[0]) for base in (32, 44, 56)]
+        if any(not 1 <= size <= 8 or offset + size > bits for offset, size in channels):
+            raise ValueError("Unsupported framebuffer color layout.")
+        masks = [((1 << size) - 1) << offset for offset, size in channels]
+        if any(masks[i] & masks[j] for i in range(3) for j in range(i)):
+            raise ValueError("Overlapping framebuffer color channels.")
+        if not matrix or any(len(row) != len(matrix) for row in matrix):
+            raise ValueError("Enrollment QR must be a nonempty square matrix.")
+        scale = min(width, height) // len(matrix)
+        if scale < 3:
+            raise ValueError("Enrollment QR needs at least three framebuffer pixels per module.")
+        surface = mmap.mmap(fd, length)
+        saved = surface[:stride * height]
+        white, black = pixel(True, channels, bits), pixel(False, channels, bits)
+        try:
+            surface[:stride * height] = (white * (stride // bytes_per_pixel)) * height
+            left = (width - len(matrix) * scale) // 2
+            top = (height - len(matrix) * scale) // 2
+            for y, row in enumerate(matrix):
+                data = b"".join((black if cell else white) * scale for cell in row)
+                for line in range(scale):
+                    offset = (top + y * scale + line) * stride + left * bytes_per_pixel
+                    surface[offset:offset + len(data)] = data
+        except (OSError, ValueError, KeyboardInterrupt):
+            surface[:len(saved)] = saved
+            surface.close()
+            raise
+        return surface, saved, {"width": width, "height": height,
+                                "modules": len(matrix), "pixels_per_module": scale}
+    finally:
+        os.close(fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--status", action="store_true", help="Read-only account counts and readiness; no credentials.")
+    args = parser.parse_args()
+    os.umask(0o077)
+    surface = None
+    saved = None
+    original_terminal = None
+    stream = None
+    failure = None
+    try:
+        if os.geteuid() != 0:
+            raise ValueError("Run the reviewed tool locally with sudo to authorize enrollment and HDMI drawing.")
+        require_local_console()
+        if args.status:
+            print(json.dumps(enrollment_status(), indent=2))
+            return 0
+        name = input("Name for the new tablet: ").strip()
+        if not name or len(name) > 64 or any(ord(c) < 32 or ord(c) == 127 for c in name):
+            raise ValueError("Tablet name must be 1-64 characters without controls.")
+        print("Real one-use enrollment: scan in Gate Keeper Connection Settings.")
+        print("QR clears on use, expiry, any key or Ctrl+C. Never photograph/share this credential QR.")
+        stream = socket.socket(socket.AF_UNIX)
+        stream.settimeout(30)
+        stream.connect("/var/lib/gatekeeper/commissioning.sock")
+        stream.sendall(json.dumps({"action": "create", "deviceName": name}).encode() + b"\n")
+        result, buffer = read_record(stream, b"")
+        if not result.get("ok"):
+            raise ValueError(result.get("message", "Enrollment failed."))
+        payload = result.get("qrText")
+        if not isinstance(payload, str) or len(payload) > 10000:
+            raise ValueError("Invalid enrollment QR response.")
+        schema = json.loads(payload)
+        if schema.get("schema") != "revpi-tablet-enrollment/v1" or not schema.get("caCertificate"):
+            raise ValueError("Enrollment QR is missing its trust/schema.")
+        encoded = subprocess.run(["qrencode", "-t", "XPM", "-s", "1", "-m", "0", "-l", "L", "-o", "-"],
+                                 input=payload, capture_output=True, text=True, timeout=10)
+        if encoded.returncode:
+            raise ValueError("Local enrollment QR encoder failed.")
+        matrix = console_module().parse_xpm(encoded.stdout)
+        original_terminal = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin)
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+        surface, saved, geometry = framebuffer_matrix(matrix)
+        deadline = min(time.time() + 300, float(result["expiresAt"]) / 1000)
+        stream.settimeout(5)
+        while time.time() < deadline:
+            readable, _, _ = select.select([stream, sys.stdin], [], [], 0.25)
+            if sys.stdin in readable:
+                sys.stdin.read(1)
+                break
+            if stream in readable:
+                ended, buffer = read_record(stream, buffer)
+                if ended.get("ended"):
+                    break
+        return 0
+    except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
+        failure = f"HDMI enrollment failed: {error}"
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if surface is not None:
+            surface[:len(saved)] = saved
+            surface.close()
+        if original_terminal is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal)
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+        if stream is not None:
+            stream.close()
+        if failure:
+            print(failure, file=sys.stderr)
+        if not args.status:
+            print("Enrollment display closed. Check the app for successful redemption; no gate control was enabled.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

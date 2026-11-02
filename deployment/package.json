@@ -1,0 +1,11 @@
+{
+  "name": "gatekeeper-app-only-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headless Gate Keeper backend foundation; enrollment commissioning required.",
+  "dependencies": {
+    "node-red": "4.1.11",
+    "node-red-node-sqlite": "2.0.1",
+    "qrcode": "1.5.4"
+  }
+}

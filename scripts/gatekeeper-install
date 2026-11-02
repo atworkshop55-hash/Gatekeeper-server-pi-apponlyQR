@@ -1,0 +1,554 @@
+#!/usr/bin/python3
+"""Gate Keeper preflight, SQLite rehearsal and explicit Raspberry Pi HDMI setup."""
+
+import argparse
+import grp
+import json
+import os
+from pathlib import Path
+import platform
+import pwd
+import shlex
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+PACKAGES = (
+    "revpi-base-files", "revpi-firmware", "revpi-tools", "revpi-nodered",
+    "python3", "nodejs", "npm", "mosquitto", "mosquitto-clients",
+    "network-manager", "dnsmasq", "sqlite3", "iproute2", "iputils-arping",
+    "openssl", "lightdm", "gdm3", "sddm",
+    "raspberrypi-sys-mods", "raspi-firmware", "raspberrypi-archive-keyring",
+)
+REQUIRED = PACKAGES[:15]
+PI_REQUIRED = REQUIRED[4:]
+HDMI_CONNECTORS = ("HDMI-A-1", "HDMI-A-2")
+HDMI_MODES = ("1280x720@60", "1920x1080@60")
+SERVICES = ("nodered.service", "mosquitto.service", "NetworkManager.service",
+            "gatekeeper-management.service", "display-manager.service")
+PATHS = (
+    "/var/lib/revpi-nodered", "/var/lib/revpi-nodered/.node-red",
+    "/var/lib/revpi-nodered/system.db",
+    "/usr/local/sbin/revpi-network", "/usr/local/sbin/revpi-management",
+    "/etc/systemd/system/gatekeeper-management.service",
+    "/etc/systemd/system/nodered.service.d/gatekeeper-network.conf",
+    "/etc/systemd/system/dnsmasq.service.d/gatekeeper-dhcp.conf",
+)
+MODULE_PATHS = {
+    name: f"/var/lib/revpi-nodered/.node-red/node_modules/{name}/package.json"
+    for name in ("qrcode", "node-red-dashboard", "node-red-node-sqlite")
+}
+MODULE_PATHS["node-red"] = "/usr/share/revpi-nodered/node_modules/node-red/package.json"
+PLAN = [
+    "Confirm maintenance account and distinct management/gate ports.",
+    "Confirm supported image and dependency/module versions; preserve vendor services.",
+    "Back up existing runtime, database and protected configuration before any apply.",
+    "Review permissions per runtime identity; never copy world-writable lab modes.",
+    "Prepare unique TLS/broker credentials and schema migrations without lab data.",
+    "Implement console-first HDMI commissioning and verify late-monitor hot-plug.",
+    "Verify enrollment, restart recovery and commissioning before enabling operation.",
+]
+
+DATABASE_TABLES = {
+    "audit_logs": (
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, "
+        "category TEXT, user TEXT, type TEXT, text TEXT"),
+    "gates": ("id TEXT PRIMARY KEY, name TEXT, ip TEXT, mac TEXT, "
+              "autoDhcp INTEGER, zone TEXT DEFAULT 'Main Facility'"),
+    "settings": "key TEXT PRIMARY KEY, value TEXT",
+    "users": "username TEXT PRIMARY KEY, password TEXT, role TEXT",
+    "zones": "id TEXT PRIMARY KEY, name TEXT UNIQUE",
+}
+DATABASE_COLUMNS = {
+    "audit_logs": ("id", "timestamp", "category", "user", "type", "text"),
+    "gates": ("id", "name", "ip", "mac", "autoDhcp", "zone"),
+    "settings": ("key", "value"),
+    "users": ("username", "password", "role"),
+    "zones": ("id", "name"),
+}
+DATABASE_INDEXES = {
+    "ux_gates_ip_unique": (
+        "gates(trim(ip)) WHERE trim(ip) <> '' AND lower(trim(ip)) NOT LIKE '%pending%'"),
+    "ux_gates_mac_unique": (
+        "gates(upper(replace(replace(replace(replace(trim(mac), ':', ''), '-', ''), '.', ''), ' ', ''))) "
+        "WHERE trim(mac) <> ''"),
+    "ux_gates_name_ci": "gates(lower(trim(name)))",
+    "ux_users_username_ci": "users(lower(trim(username)))",
+    "ux_zones_name_ci": "zones(lower(trim(name)))",
+}
+DATABASE_DEFAULTS = {
+    "siteName": "RevPi Control System", "sessionTimeout": "300", "logRetention": "3",
+}
+
+
+def prepare_database(connection):
+    """Prepare a caller-owned offline staging database, never a live runtime."""
+    if connection.in_transaction:
+        raise ValueError("Database setup requires a connection without an active transaction.")
+    if connection.execute("PRAGMA user_version").fetchone()[0] not in (0, 1):
+        raise ValueError("Unknown database version; migration review required.")
+    if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+        raise ValueError("Database integrity check failed; do not initialize over damaged data.")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = dict(connection.execute(
+            "SELECT name, type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
+        user_tables = {name for name, kind in existing.items() if kind == "table"}
+        if user_tables and user_tables != set(DATABASE_TABLES):
+            raise ValueError("Existing database must contain exactly the known application tables.")
+        if any(kind in ("view", "trigger") for kind in existing.values()):
+            raise ValueError("Unexpected view/trigger; migration review required.")
+        if not user_tables and existing:
+            raise ValueError("Unexpected existing schema; migration review required.")
+        for name, definition in DATABASE_TABLES.items():
+            connection.execute(f"CREATE TABLE IF NOT EXISTS {name} ({definition})")
+            actual = connection.execute(f"PRAGMA table_info({name})").fetchall()
+            if tuple(row[1] for row in actual) != DATABASE_COLUMNS[name]:
+                raise ValueError(f"{name}: unsupported columns; migration review required.")
+            # Compare constraints/types/defaults to the reference, not just column names.
+            reference = sqlite3.connect(":memory:")
+            try:
+                reference.execute(f"CREATE TABLE {name} ({definition})")
+                if actual != reference.execute(f"PRAGMA table_info({name})").fetchall():
+                    raise ValueError(f"{name}: unsupported column definitions.")
+            finally:
+                reference.close()
+        for name, definition in DATABASE_INDEXES.items():
+            expected = f"CREATE UNIQUE INDEX {name} ON {definition}"
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()
+            if row:
+                normalize = lambda sql: " ".join(sql.strip().rstrip(";").split()).lower()
+                if normalize(row[0]) != normalize(expected):
+                    raise ValueError(f"{name}: unsupported index definition.")
+            else:
+                connection.execute(expected)
+        for key, value in DATABASE_DEFAULTS.items():
+            connection.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (key, value))
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    except (sqlite3.Error, ValueError):
+        connection.rollback()
+        raise
+    return {"schema_version": 1, "tables": sorted(DATABASE_TABLES),
+            "indexes": sorted(DATABASE_INDEXES),
+            "seeded_setting_keys": sorted(DATABASE_DEFAULTS),
+            "admin_created": False, "tablet_registered": False,
+            "network_configuration_seeded": False, "ready_for_deployment": False}
+
+
+def database_rehearsal():
+    # No caller-supplied path: this stage cannot select the working database.
+    with tempfile.TemporaryDirectory(prefix="gatekeeper-database-rehearsal-") as directory:
+        path = Path(directory) / "system.db"
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        connection = sqlite3.connect(path)
+        try:
+            result = prepare_database(connection)
+            prepare_database(connection)
+            counts = {name: connection.execute(f"SELECT count(*) FROM {name}").fetchone()[0]
+                      for name in ("users", "gates", "zones", "audit_logs")}
+            if any(counts.values()):
+                raise ValueError("Fresh setup must not seed users, gates, zones or audit history.")
+            result.update(mode="temporary-database-rehearsal", rerun_verified=True,
+                          empty_table_counts=counts, temporary_database_removed_on_exit=True,
+                          permissions="0600; owned by invoking user, not deployment ownership")
+            return result
+        finally:
+            connection.close()
+
+
+class Inventory:
+    def __init__(self):
+        self.checks = []
+
+    def check(self, status, code, message):
+        self.checks.append({"status": status, "code": code, "message": message})
+
+    def command(self, *args):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.check("warning", "probe-failed", f"{args[0]}: {error}")
+            return None
+        if result.returncode:
+            # Do not echo arbitrary subprocess output into a provisioning report.
+            self.check("warning", "probe-failed",
+                       f"{' '.join(args)} exited {result.returncode}; inspect locally.")
+            return None
+        return result.stdout.strip()
+
+    def text(self, path, optional=False):
+        try:
+            return Path(path).read_text().strip().strip("\0")
+        except FileNotFoundError:
+            if not optional:
+                self.check("warning", "file-missing", f"{path} is missing.")
+        except (OSError, UnicodeError) as error:
+            self.check("warning", "file-unreadable", f"{path}: {error}")
+        return None
+
+    def json_command(self, *args):
+        value = self.command(*args)
+        if value is None:
+            return None
+        try:
+            result = json.loads(value)
+            if not isinstance(result, list):
+                raise ValueError("Expected an array")
+            return result
+        except ValueError:
+            self.check("warning", "invalid-probe", f"{args[0]} returned invalid JSON.")
+            return None
+
+
+def parse_os(value):
+    fields = {}
+    for line in (value or "").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        tokens = shlex.split(raw)
+        fields[key] = " ".join(tokens)
+    return {key: fields.get(key, "") for key in
+            ("ID", "VERSION_ID", "PRETTY_NAME", "VERSION_CODENAME")}
+
+
+def installed_packages(inventory):
+    output = inventory.command(
+        "dpkg-query", "-W", "-f=${binary:Package}\\t${db:Status-Status}\\t${Version}\\n")
+    if output is None:
+        return {}
+    installed = {}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 3 and fields[1] == "installed":
+            installed[fields[0].split(":")[0]] = fields[2]
+    return {name: installed[name] for name in PACKAGES if name in installed}
+
+
+def platform_checks(inventory, os_info, architecture, packages, markers, model=""):
+    vendor = "revpi-base-files" in packages and bool(markers)
+    raspberry = (not markers and "revpi-base-files" not in packages
+                 and "raspberrypi-sys-mods" in packages
+                 and "raspi-firmware" in packages
+                 and model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")))
+    if not vendor and not raspberry:
+        inventory.check("blocked", "not-revpi",
+                        "Require RevPi vendor/hardware markers or Raspberry Pi 4/5 vendor packages/model.")
+    if os_info.get("ID") != "debian" or os_info.get("VERSION_ID") != "13" or architecture != "arm64":
+        inventory.check("blocked", "unvalidated-image",
+                        "Reference profiles require Debian 13 Trixie arm64; other images need review.")
+    inventory.check("warning", "reference-only",
+                    "Matching the reference profile is not installation or commissioning certification.")
+    if raspberry:
+        inventory.check("warning", "pi-runtime-pending",
+                        "Raspberry Pi profile: server installation and RevPi-specific flow dependencies are not implemented.")
+    return "revpi-trixie-arm64" if vendor else "raspberry-pi-trixie-arm64" if raspberry else "unsupported"
+
+
+def hdmi_metadata(inventory):
+    connectors = []
+    for path in sorted(Path("/sys/class/drm").glob("card*-HDMI-A-*")):
+        connectors.append({
+            "name": path.name.split("-", 1)[1],
+            "status": inventory.text(path / "status"),
+            "modes": (inventory.text(path / "modes") or "").splitlines(),
+        })
+    return connectors
+
+
+def hdmi_command_line(original, connector, mode):
+    if connector not in HDMI_CONNECTORS or mode not in HDMI_MODES:
+        raise ValueError("Select HDMI-A-1/HDMI-A-2 and a supported fallback mode.")
+    lines = original.splitlines()
+    if len(lines) != 1 or not lines[0].strip():
+        raise ValueError("Kernel command line must contain exactly one nonempty line.")
+    tokens = lines[0].split()
+    if "nomodeset" in tokens:
+        raise ValueError("nomodeset conflicts with KMS HDMI; review boot configuration.")
+    desired = f"video={connector}:{mode}D"
+    existing = [token for token in tokens if token.startswith(f"video={connector}:")]
+    if existing and existing != [desired]:
+        raise ValueError(f"{connector} already has a conflicting video setting; review it manually.")
+    if desired not in tokens:
+        tokens.append(desired)
+    if "console=tty1" not in tokens:
+        tokens.append("console=tty1")
+    return " ".join(tokens) + "\n"
+
+
+def hdmi_preview(inventory, profile, connector, mode,
+                 config_path=Path("/boot/firmware/config.txt"),
+                 cmdline_path=Path("/boot/firmware/cmdline.txt")):
+    if profile != "raspberry-pi-trixie-arm64":
+        raise ValueError("HDMI modification is currently limited to the Raspberry Pi Trixie profile.")
+    if config_path.is_symlink() or cmdline_path.is_symlink():
+        raise ValueError("Boot file symlinks require explicit review.")
+    config = config_path.read_text()
+    if "dtoverlay=vc4-kms-v3d" not in [line.strip() for line in config.splitlines()]:
+        raise ValueError("Expected VC4 KMS overlay is missing; do not apply legacy HDMI flags.")
+    original = cmdline_path.read_text()
+    updated = hdmi_command_line(original, connector, mode)
+    inventory.check("warning", "hdmi-reboot-test",
+                    "Force digital HDMI at a fallback mode; reboot and late-monitor physical acceptance required.")
+    return {"mode": "hdmi-preview", "connector": connector, "fallback_mode": mode,
+            "kernel_argument": f"video={connector}:{mode}D", "cmdline_path": str(cmdline_path),
+            "change_needed": updated != original, "reboot_automatic": False,
+            "autologin_enabled": False, "hotplug_verified": False}
+
+
+def configure_hdmi(inventory, profile, connector, mode,
+                   config_path=Path("/boot/firmware/config.txt"),
+                   cmdline_path=Path("/boot/firmware/cmdline.txt")):
+    preview = hdmi_preview(inventory, profile, connector, mode, config_path, cmdline_path)
+    if os.geteuid() != 0:
+        raise ValueError("HDMI configuration needs local sudo; no changes made.")
+    if not preview["change_needed"]:
+        return dict(preview, mode="hdmi-already-configured", backup=None)
+    print(json.dumps(preview, indent=2))
+    print("This changes boot display arguments only. SSH/network settings and login policy are untouched.")
+    if input(f"Type {connector} to confirm the boot-file change: ").strip() != connector:
+        raise ValueError("HDMI change cancelled; no changes made.")
+    path = Path(preview["cmdline_path"])
+    original = path.read_bytes()
+    metadata = path.stat()
+    updated = hdmi_command_line(original.decode(), connector, mode).encode()
+    backup = path.with_name(path.name + f".gatekeeper-hdmi-{time.time_ns()}.bak")
+    with backup.open("xb") as stream:
+        stream.write(original)
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor, temporary = tempfile.mkstemp(prefix=".gatekeeper-hdmi-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            temporary_stat = os.fstat(stream.fileno())
+            if stat.S_IMODE(temporary_stat.st_mode) != stat.S_IMODE(metadata.st_mode):
+                os.fchmod(stream.fileno(), stat.S_IMODE(metadata.st_mode))
+            if (temporary_stat.st_uid, temporary_stat.st_gid) != (metadata.st_uid, metadata.st_gid):
+                os.fchown(stream.fileno(), metadata.st_uid, metadata.st_gid)
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Preserve boot partition semantics; chmod/chown may be unsupported on FAT.
+        if path.is_symlink() or path.read_bytes() != original:
+            raise ValueError("Boot command line changed during confirmation; refusing replacement.")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return dict(preview, mode="hdmi-configured", backup=str(backup), reboot_required=True)
+
+
+def account_candidate(inventory, selected=None):
+    effective = pwd.getpwuid(os.geteuid())
+    source = "explicit" if selected else "effective-user"
+    candidate = selected
+    if not candidate and effective.pw_uid == 0:
+        candidate = os.environ.get("SUDO_USER")
+        source = "sudo-candidate"
+        if candidate:
+            entry = pwd.getpwnam(candidate)
+            if str(entry.pw_uid) != os.environ.get("SUDO_UID"):
+                inventory.check("blocked", "account-mismatch", "SUDO_USER and SUDO_UID do not match.")
+                return {"effective": effective.pw_name, "candidate": None}
+    entry = pwd.getpwnam(candidate) if candidate else effective
+    if entry.pw_uid == 0 or entry.pw_shell in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false"):
+        inventory.check("blocked", "maintenance-account",
+                        "Select a non-root human maintenance account with --maintenance-user.")
+    inventory.check("warning", "account-confirmation",
+                    "Account is a candidate only; confirm human ownership, admin access and password/key policy.")
+    return {"effective": effective.pw_name, "candidate": entry.pw_name,
+            "uid": entry.pw_uid, "group": grp.getgrgid(entry.pw_gid).gr_name,
+            "home": entry.pw_dir, "shell": entry.pw_shell, "source": source,
+            "confirmed": False}
+
+
+def path_metadata(inventory, path):
+    try:
+        value = Path(path).stat()
+    except FileNotFoundError:
+        return {"path": path, "exists": False}
+    except OSError as error:
+        inventory.check("warning", "stat-failed", f"{path}: {error}")
+        return {"path": path, "exists": None}
+    if value.st_mode & stat.S_IWOTH:
+        inventory.check("warning", "world-writable",
+                        f"{path} is world-writable; review, do not reproduce or auto-correct.")
+    try:
+        owner = pwd.getpwuid(value.st_uid).pw_name
+    except KeyError:
+        owner = str(value.st_uid)
+        inventory.check("warning", "unknown-owner", f"{path}: UID {value.st_uid} has no account.")
+    try:
+        group = grp.getgrgid(value.st_gid).gr_name
+    except KeyError:
+        group = str(value.st_gid)
+        inventory.check("warning", "unknown-group", f"{path}: GID {value.st_gid} has no group.")
+    return {"path": path, "exists": True, "mode": format(stat.S_IMODE(value.st_mode), "04o"),
+            "uid": value.st_uid, "gid": value.st_gid,
+            "owner": owner, "group": group,
+            "symlink": Path(path).is_symlink()}
+
+
+def service_metadata(inventory, name):
+    output = inventory.command(
+        "systemctl", "show", name,
+        "--property=Id,LoadState,ActiveState,User,Group,FragmentPath,ProtectSystem,ReadWritePaths")
+    fields = dict(line.split("=", 1) for line in (output or "").splitlines() if "=" in line)
+    if not fields:
+        inventory.check("warning", "service-unknown", f"Could not inspect {name}.")
+    return fields
+
+
+def network_metadata(inventory):
+    links = inventory.json_command("ip", "-j", "address", "show")
+    routes = inventory.json_command("ip", "-j", "route", "show", "default")
+    ports = []
+    for link in links or []:
+        name = link.get("ifname", "")
+        base = Path("/sys/class/net") / name
+        if not (base / "device").exists() or (base / "wireless").exists():
+            continue
+        ports.append({"name": name, "mac": link.get("address"),
+                      "state": link.get("operstate"),
+                      "device": str((base / "device").resolve()),
+                      "addresses": [a.get("local") for a in link.get("addr_info", [])]})
+    inventory.check("warning", "port-confirmation",
+                    "No roles assigned. Confirm two physical Ethernet ports and protect the SSH/uplink route before apply.")
+    return {"ports": ports, "default_route_interfaces":
+            sorted({r["dev"] for r in routes or [] if "dev" in r}),
+            "roles_confirmed": False}
+
+
+def module_versions(inventory, profile="revpi-trixie-arm64"):
+    versions = {}
+    if profile != "revpi-trixie-arm64":
+        inventory.check("warning", "runtime-layout-pending",
+                        "Non-RevPi Node-RED runtime layout not installed/verified; no vendor paths assumed.")
+        return versions
+    for name, path in MODULE_PATHS.items():
+        value = inventory.text(path, optional=True)
+        if value is None:
+            inventory.check("warning", "module-unverified",
+                            f"{name}: not verified in the reference runtime directory.")
+            continue
+        try:
+            versions[name] = json.loads(value)["version"]
+        except (ValueError, KeyError, TypeError):
+            inventory.check("warning", "module-invalid", f"{name}: invalid package metadata.")
+    return versions
+
+
+def collect(selected=None, connector=None, mode="1280x720@60"):
+    inventory = Inventory()
+    os_info = parse_os(inventory.text("/etc/os-release"))
+    architecture = inventory.command("dpkg", "--print-architecture")
+    packages = installed_packages(inventory)
+    markers = [path for path in ("/dev/piControl0", "/sys/class/piControl")
+               if Path(path).exists()]
+    model = inventory.text("/proc/device-tree/model", optional=True) or ""
+    profile = platform_checks(inventory, os_info, architecture, packages, markers, model)
+    missing = [name for name in (PI_REQUIRED if profile == "raspberry-pi-trixie-arm64" else REQUIRED)
+               if name not in packages]
+    if missing:
+        inventory.check("warning", "dependencies-missing",
+                        "Packages to review for installation: " + ", ".join(missing))
+    default_target = inventory.command("systemctl", "get-default")
+    services = {name: service_metadata(inventory, name) for name in SERVICES}
+    if default_target != "multi-user.target" or services["display-manager.service"].get("ActiveState") == "active":
+        inventory.check("warning", "desktop-review",
+                        "Console-first commissioning needs review; no boot/display changes made.")
+    inventory.check("warning", "hdmi-unverified",
+                    "HDMI hot-plug, fallback mode and input support require model/image-specific physical testing.")
+    report = {
+        "schema": "gatekeeper-install-preflight/v1", "mode": "read-only",
+        "apply_implemented": False, "ready_for_deployment": False,
+        "system": {"os": os_info, "architecture": architecture,
+                   "kernel": platform.release(),
+                   "profile": profile, "model": model,
+                   "revpi_markers": markers},
+        "account": account_candidate(inventory, selected),
+        "packages": packages, "missing_packages": missing,
+        "services": services, "paths": [path_metadata(inventory, path) for path in PATHS]
+        if profile == "revpi-trixie-arm64" else [],
+        "network": network_metadata(inventory),
+        "display": {"default_target": default_target,
+                    "desktop_packages": [name for name in ("lightdm", "gdm3", "sddm") if name in packages],
+                    "boot_config_candidates": [path for path in
+                        ("/boot/firmware/config.txt", "/boot/config.txt") if Path(path).exists()],
+                    "hotplug_verified": False},
+        "modules": module_versions(inventory, profile), "plan": PLAN,
+        "checks": inventory.checks,
+    }
+    report["display"]["connectors"] = hdmi_metadata(inventory)
+    if profile == "raspberry-pi-trixie-arm64":
+        report["paths"] = []
+        report["runtime_path_policy"] = "Non-RevPi runtime layout pending; no vendor paths used."
+    if connector:
+        report["hdmi_preview"] = hdmi_preview(inventory, profile, connector, mode)
+    return report
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="Print structured inventory instead of text.")
+    parser.add_argument("--maintenance-user", help="Inspect an existing maintenance account; never create/change it.")
+    parser.add_argument("--database-rehearsal", action="store_true",
+                        help="Create/test/delete a temporary SQLite database only; never use the live database.")
+    parser.add_argument("--hdmi-connector", choices=HDMI_CONNECTORS,
+                        help="Preview persistent KMS HDMI fallback for the selected port.")
+    parser.add_argument("--hdmi-mode", choices=HDMI_MODES, default="1280x720@60")
+    parser.add_argument("--configure-hdmi", action="store_true",
+                        help="Explicit local-sudo boot display change, backed up and interactively confirmed; no reboot.")
+    args = parser.parse_args(argv)
+    if args.configure_hdmi and (not args.hdmi_connector or args.json):
+        parser.error("--configure-hdmi needs --hdmi-connector and an interactive session (no --json).")
+    if sys.platform != "linux":
+        parser.exit(2, "gatekeeper-install requires Linux; no changes made.\n")
+    if args.database_rehearsal:
+        if args.maintenance_user or args.hdmi_connector or args.configure_hdmi:
+            parser.error("Database rehearsal cannot be combined with account/HDMI options.")
+        try:
+            result = database_rehearsal()
+        except (OSError, sqlite3.Error, ValueError) as error:
+            parser.exit(2, f"Temporary database rehearsal failed: {error}; live database untouched.\n")
+        print(json.dumps(result, indent=2))
+        return 0
+    try:
+        report = collect(args.maintenance_user) if not args.hdmi_connector else collect(
+            args.maintenance_user, args.hdmi_connector, args.hdmi_mode)
+        if args.configure_hdmi:
+            if any(c["status"] == "blocked" for c in report["checks"]):
+                raise ValueError("Resolve preflight blockers before changing HDMI boot configuration.")
+            result = configure_hdmi(Inventory(), report["system"]["profile"],
+                                    args.hdmi_connector, args.hdmi_mode)
+            print(json.dumps(result, indent=2))
+            print("No automatic reboot. Run sudo reboot locally when ready; keep the reported backup.")
+            return 0
+    except (OSError, ValueError, KeyError, EOFError) as error:
+        parser.exit(2, f"Installer stage failed: {error}. Inspect any reported HDMI backup before retrying.\n")
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("Gate Keeper installer - READ-ONLY preflight; apply is not implemented")
+        print(json.dumps({key: value for key, value in report.items()
+                          if key not in ("checks", "plan")}, indent=2))
+        for check in report["checks"]:
+            print(f"{check['status'].upper()} [{check['code']}]: {check['message']}")
+        print("\nProposed work (NOT executed):")
+        for step in report["plan"]:
+            print(f"- {step}")
+        print("\nNot ready for deployment. No system configuration changed.")
+    return 2 if any(c["status"] == "blocked" for c in report["checks"]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

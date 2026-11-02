@@ -1,0 +1,170 @@
+#!/usr/bin/python3
+"""Restricted local static gate-network service; no TCP or general command API."""
+
+import base64
+import json
+import os
+from pathlib import Path
+import pwd
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import re
+
+import gatekeeper_interfaces as interfaces
+
+
+LOCK = threading.Lock()
+ERRORS = (ValueError, RuntimeError, OSError, subprocess.SubprocessError)
+REFERENCE_APP = False
+
+
+def execute_reference(request):
+    action = request.get("action")
+    root = Path(__file__).resolve().parent
+    if action == "apply_gate":
+        config = request.get("config")
+        if not isinstance(config, dict):
+            raise ValueError("Gate configuration required.")
+        interfaces.validate_request("gate", config.get("interface"))
+        helper, options = root / "revpi-network", [
+            base64.b64encode(json.dumps(config).encode()).decode()]
+    elif action == "apply_management":
+        config = request.get("config")
+        if not isinstance(config, dict):
+            raise ValueError("Management configuration required.")
+        interfaces.validate_request("management", config.get("interface"))
+        helper, options = root / "revpi-management", [
+            "apply", base64.b64encode(json.dumps(config).encode()).decode()]
+    elif action == "confirm_management":
+        pending = request.get("pendingId")
+        if not isinstance(pending, str) or not re.fullmatch(r"[a-f0-9-]{36}", pending):
+            raise ValueError("Valid pending management change required.")
+        helper, options = root / "revpi-management", ["confirm", pending]
+    elif action == "reboot":
+        result = subprocess.run(["/usr/bin/systemctl", "--no-block", "reboot"],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise RuntimeError("System reboot request failed: " + result.stderr.strip())
+        return {"ok": True, "message": "System reboot requested."}
+    else:
+        raise ValueError("Unsupported reference platform action.")
+    result = subprocess.run(["/usr/bin/python3", "-B", str(helper), *options],
+                            capture_output=True, text=True, timeout=110)
+    reply = json.loads(result.stdout)
+    if not isinstance(reply, dict):
+        raise ValueError("Platform helper returned an invalid result.")
+    if result.returncode or reply.get("ok") is not True:
+        raise RuntimeError(reply.get("message", "Platform helper failed."))
+    return reply
+
+
+def validate(request):
+    if not isinstance(request, dict) or request.get("action") not in ("status", "apply_static"):
+        raise ValueError("Only status and static gate-port application are enabled.")
+    if request["action"] == "status":
+        return None
+    config = request.get("config")
+    if not isinstance(config, dict) or config.get("masterMode") != "client" or config.get("clientMode") != "static":
+        raise ValueError("Only static/client gate mode is enabled; DHCP modes require separate commissioning.")
+    interfaces.validate_request("gate", config.get("interface"))
+    address = config.get("staticIp")
+    if not isinstance(address, str):
+        raise ValueError("Static IPv4 address required.")
+    return {"interface": "lan1", "masterMode": "client", "clientMode": "static", "staticIp": address}
+
+
+def execute(request):
+    if REFERENCE_APP and isinstance(request, dict) and request.get("action") in (
+            "apply_gate", "apply_management", "confirm_management", "reboot"):
+        return execute_reference(request)
+    config = validate(request)
+    roles = interfaces.resolved_roles(interfaces.read_mapping(), interfaces.inventory())
+    interfaces.ensure_gate_not_management(roles["gate"])
+    if config is None:
+        return {"ok": True, "staticWritesEnabled": True, "roles": roles}
+    if Path("/etc/dnsmasq.d/ot-network.conf").exists():
+        raise ValueError("Existing gate DHCP configuration requires local review.")
+    helper = Path(__file__).resolve().with_name("revpi-network")
+    encoded = base64.b64encode(json.dumps(config).encode()).decode()
+    # Fixed root-owned helper; no request-controlled executable, arguments or shell.
+    result = subprocess.run(["/usr/bin/python3", "-B", str(helper), encoded],
+                            capture_output=True, text=True, timeout=110)
+    reply = json.loads(result.stdout)
+    if result.returncode or reply.get("ok") is not True:
+        raise RuntimeError(reply.get("message", "Static network helper failed."))
+    return reply
+
+
+def handle(stream, allowed_uid):
+    uid = struct.unpack("3i", stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    if uid not in (0, allowed_uid):
+        raise ValueError("Unauthorized network service peer.")
+    stream.settimeout(5)
+    buffer = b""
+    while b"\n" not in buffer:
+        data = stream.recv(2048)
+        if not data:
+            raise ValueError("Incomplete network service request.")
+        buffer += data
+        if len(buffer) > 4096:
+            raise ValueError("Network request exceeds limit.")
+    record, remainder = buffer.split(b"\n", 1)
+    if remainder:
+        raise ValueError("Only one network request per connection.")
+    request = json.loads(record)
+    if not LOCK.acquire(blocking=False):
+        raise ValueError("Another gate-network operation is running; retry after it completes.")
+    try:
+        return execute(request)
+    finally:
+        LOCK.release()
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    block_on_close = False
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            reply = handle(self.request, self.server.allowed_uid)
+        except ERRORS as error:
+            print("Network service rejected/failed: " + str(error), file=sys.stderr, flush=True)
+            reply = {"ok": False, "message": str(error)}
+        try:
+            self.request.sendall((json.dumps(reply) + "\n").encode())
+        except OSError as error:
+            print("Network service reply delivery failed: " + str(error), file=sys.stderr, flush=True)
+
+
+def main():
+    global REFERENCE_APP
+    if sys.argv[1:] not in ([], ["--reference-app"]):
+        raise ValueError("Use no arguments or --reference-app.")
+    REFERENCE_APP = sys.argv[1:] == ["--reference-app"]
+    if os.geteuid() != 0:
+        raise ValueError("Network service requires its reviewed root systemd identity.")
+    account = pwd.getpwnam("gatekeeper")
+    path = Path("/run/gatekeeper-network/control.sock")
+    if path.exists() or path.is_symlink():
+        if not path.is_socket() or path.is_symlink():
+            raise ValueError("Unexpected network socket path.")
+        path.unlink()
+    with Server(str(path), Handler) as server:
+        os.chown(path, 0, account.pw_gid)
+        path.chmod(0o660)
+        server.allowed_uid = account.pw_uid
+        server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ERRORS as error:
+        print("ERROR: " + str(error), file=sys.stderr)
+        sys.exit(1)

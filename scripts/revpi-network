@@ -1,0 +1,202 @@
+#!/usr/bin/python3
+"""Apply the gate LAN configuration using a persistent NetworkManager profile."""
+
+import base64
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import gatekeeper_interfaces as interfaces
+
+
+CONF = Path("/etc/dnsmasq.d/ot-network.conf")
+
+
+def run(*args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=50)
+    if result.returncode:
+        raise RuntimeError(f"{' '.join(args[:3])}: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout.strip()
+
+
+def validate(config):
+    interfaces.validate_request("gate", config.get("interface"))
+    if config.get("masterMode") not in ("server", "client"):
+        raise ValueError("Choose DHCP server or client mode.")
+    mode = "server" if config["masterMode"] == "server" else config.get("clientMode")
+    if mode not in ("server", "dhcp", "static"):
+        raise ValueError("Choose DHCP or static client mode.")
+
+    def address(key):
+        value = ipaddress.IPv4Address(config.get(key, ""))
+        if int(value) >> 24 in (0, 127) or value.is_multicast or int(value) >> 28 == 15:
+            raise ValueError("Use a unicast IPv4 address.")
+        if int(value) & 255 in (0, 255):
+            raise ValueError("Network and broadcast addresses cannot be assigned on a /24 network.")
+        return value
+
+    if mode == "server":
+        gateway, start, end = (address(key) for key in ("gateway", "ipStart", "ipEnd"))
+        network = ipaddress.IPv4Network(f"{gateway}/24", strict=False)
+        if start not in network or end not in network or start > end or start <= gateway <= end:
+            raise ValueError("Use an ordered DHCP range in the same /24, excluding the RevPi address.")
+    elif mode == "static":
+        address("staticIp")
+    return mode
+
+
+def apply(config):
+    mode = validate(config)
+    interface = interfaces.resolve("gate")
+    interfaces.ensure_gate_not_management(interface)
+    if mode != "dhcp":
+        requested_ip = config["gateway"] if mode == "server" else config["staticIp"]
+        interfaces.ensure_gate_subnet(interface, requested_ip)
+        run("arping", "-D", "-q", "-c", "3", "-w", "4", "-I", interface, requested_ip)
+    server_installed = Path("/usr/sbin/dnsmasq").exists()
+    if mode == "server" and not server_installed:
+        raise RuntimeError("dnsmasq is not installed. Install the DHCP server before applying server mode.")
+
+    # Reuse the profile bound to this port, including an inactive one.
+    mapping = interfaces.read_mapping()
+    active = run("nmcli", "-g", "GENERAL.CON-UUID", "device", "show", interface)
+    profiles = []
+    for uuid in run("nmcli", "-g", "UUID", "connection", "show").splitlines():
+        bound_interface = run("nmcli", "-g", "connection.interface-name", "connection", "show", uuid)
+        bound_mac = run("nmcli", "-g", "802-3-ethernet.mac-address", "connection", "show", uuid).replace("\\:", ":").lower() if mapping else ""
+        if mapping and bound_mac == mapping["roles"]["gate"]["mac"] and bound_interface not in ("", interface):
+            raise ValueError("Gate profile has a stale interface-name binding; review it before activation.")
+        if bound_interface == interface or (mapping and bound_mac == mapping["roles"]["gate"]["mac"]):
+            profiles.append(uuid)
+    if active and active != "--":
+        uuid = active
+    elif len(profiles) == 1:
+        uuid = profiles[0]
+    elif profiles:
+        raise RuntimeError(f"Multiple profiles are bound to {interface}; resolve them before applying.")
+    else:
+        uuid = None
+
+    keys = ("ipv4.method", "ipv4.addresses", "ipv4.gateway", "ipv4.never-default",
+            "ipv4.ignore-auto-dns", "connection.autoconnect")
+    if mapping is not None:
+        keys += ("connection.interface-name", "802-3-ethernet.mac-address")
+    previous = {key: run("nmcli", "-g", key, "connection", "show", uuid) for key in keys} if uuid else {}
+    if mapping is not None and previous:
+        previous["802-3-ethernet.mac-address"] = previous["802-3-ethernet.mac-address"].replace("\\:", ":")
+    old_file = CONF.read_bytes() if CONF.exists() else None
+    if mode == "server" or old_file is not None:
+        CONF.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryFile(dir=CONF.parent):
+                pass
+        except OSError as error:
+            raise RuntimeError(
+                "DHCP configuration directory is not writable. Install the "
+                "gatekeeper-network.conf Node-RED systemd drop-in."
+            ) from error
+    service_was_active = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "dnsmasq"], check=False
+    ).returncode == 0 if server_installed else False
+    created = False
+    touched_service = server_installed and (mode == "server" or old_file is not None)
+    try:
+        if touched_service:
+            run("systemctl", "stop", "dnsmasq")
+        if not uuid:
+            run("nmcli", "connection", "add", "type", "ethernet", "ifname", interface,
+                "con-name", f"GateKeeper-{interface}", "connection.autoconnect", "no")
+            uuid = run("nmcli", "-g", "connection.uuid", "connection", "show", f"GateKeeper-{interface}")
+            created = True
+        ip = config["gateway"] if mode == "server" else config.get("staticIp", "")
+        settings = {"ipv4.method": "auto" if mode == "dhcp" else "manual",
+                    "ipv4.addresses": "" if mode == "dhcp" else f"{ip}/24",
+                    "ipv4.gateway": "", "ipv4.never-default": "yes",
+                    "ipv4.ignore-auto-dns": "yes", "connection.autoconnect": "yes"}
+        if mapping is not None:
+            settings.update({"connection.interface-name": "",
+                             "802-3-ethernet.mac-address": mapping["roles"]["gate"]["mac"]})
+        run("nmcli", "connection", "modify", uuid,
+            *[item for pair in settings.items() for item in pair])
+        if mode == "server":
+            CONF.parent.mkdir(parents=True, exist_ok=True)
+            CONF.write_text(f"port=0\ninterface={interface}\nbind-dynamic\n"
+                            f"dhcp-range={config['ipStart']},{config['ipEnd']},255.255.255.0,24h\n"
+                            "dhcp-option=3\ndhcp-option=6\n", encoding="ascii")
+            run("dnsmasq", "--test")
+        elif old_file is not None:
+            CONF.unlink()
+        run("nmcli", "--wait", "35", "connection", "up", "uuid", uuid, "ifname", interface)
+        addresses = json.loads(run("ip", "-j", "-4", "addr", "show", "dev", interface))
+        ips = [entry["local"] for device in addresses for entry in device["addr_info"]
+               if entry.get("family") == "inet"]
+        if not ips or (mode != "dhcp" and ip not in ips):
+            raise RuntimeError(f"{interface} has no expected IPv4 address after activation.")
+        if mode == "server":
+            run("systemctl", "start", "dnsmasq")
+        normalized = dict(config, interface=interface)
+        return {"ok": True, "message": f"{interface}: {mode} active at {', '.join(ips)}.",
+                "config": normalized, "address": ips[0], "profile": uuid}
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as error:
+        rollback_errors = []
+        operations = []
+        if created:
+            operations.append(("nmcli", "connection", "delete", uuid))
+        elif previous:
+            operations.append(("nmcli", "connection", "modify", uuid,
+                               *[item for pair in previous.items() for item in pair]))
+            if active and active != "--":
+                operations.append(("nmcli", "--wait", "35", "connection", "up", "uuid", uuid))
+            else:
+                # Do not leave a new address active after restoring an inactive profile.
+                try:
+                    current = run("nmcli", "-g", "GENERAL.CON-UUID", "device", "show", interface)
+                    if current == uuid:
+                        operations.insert(0, ("nmcli", "connection", "down", "uuid", uuid))
+                except (RuntimeError, OSError, subprocess.SubprocessError) as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+        for operation in operations:
+            try:
+                run(*operation)
+            except (RuntimeError, OSError, subprocess.SubprocessError) as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        try:
+            if old_file is None:
+                CONF.unlink(missing_ok=True)
+            else:
+                CONF.write_bytes(old_file)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as rollback_error:
+            rollback_errors.append(str(rollback_error))
+        if touched_service:
+            try:
+                run("systemctl", "start" if service_was_active else "stop", "dnsmasq")
+            except (RuntimeError, OSError, subprocess.SubprocessError) as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        details = "; rollback failed: " + "; ".join(rollback_errors) if rollback_errors else "; previous settings restored."
+        raise RuntimeError(str(error) + details) from error
+
+
+def main():
+    try:
+        if os.geteuid() != 0:
+            raise RuntimeError("Run this helper as root.")
+        config = json.loads(base64.b64decode(sys.argv[1], validate=True))
+        with open("/run/lock/gatekeeper-network.lock", "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError("Another network change is already running.") from error
+            result = apply(config)
+        print(json.dumps(result))
+        return 0
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, IndexError, TypeError) as error:
+        print(json.dumps({"ok": False, "message": str(error)}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

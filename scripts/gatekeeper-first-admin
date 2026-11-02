@@ -1,0 +1,276 @@
+#!/usr/bin/python3
+"""Locally authorized first app-admin provisioning; never creates a Linux user."""
+
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import sqlite3
+import stat
+import subprocess
+import sys
+import time
+
+
+DATABASE = Path("/var/lib/gatekeeper/system.db")
+FOUNDATION = Path("/var/lib/gatekeeper/flows.json")
+BACKUPS = Path("/etc/gatekeeper/admin-backups")
+EXPECTED_COLUMNS = {
+    "users": ("username", "password", "role"),
+    "settings": ("key", "value"),
+    "audit_logs": ("id", "timestamp", "category", "user", "type", "text"),
+}
+
+
+def validate_fields(username, password, site):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", username) or (
+            username.lower() in ("constructor", "prototype")):
+        raise ValueError("Username must be 1-64 letters/digits/underscore/hyphen, starting with a letter/digit.")
+    if not 12 <= len(password) <= 128 or password != password.strip() or any(
+            ord(character) < 32 or ord(character) == 127 for character in password):
+        raise ValueError("Use a 12-128 character password, without surrounding whitespace or control characters.")
+    if not site or len(site) > 80 or site != site.strip() or any(
+            ord(character) < 32 or ord(character) == 127 for character in site):
+        raise ValueError("Site name must be 1-80 characters without surrounding whitespace or control characters.")
+
+
+def verify_database(connection):
+    if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+        raise ValueError("Expected provisioned schema version 1; do not create or repair a database here.")
+    if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+        raise ValueError("Database integrity check failed.")
+    for table, columns in EXPECTED_COLUMNS.items():
+        actual = tuple(row[1] for row in connection.execute(f"PRAGMA table_info({table})"))
+        if actual != columns:
+            raise ValueError(f"Unexpected {table} schema.")
+    objects = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('trigger','view')").fetchall()
+    if objects:
+        raise ValueError("Unexpected trigger/view; review schema before provisioning.")
+
+
+def verify_empty_database(connection):
+    verify_database(connection)
+    if connection.execute("SELECT count(*) FROM users").fetchone()[0]:
+        raise ValueError("Application users already exist; first-admin setup cannot overwrite them.")
+    if connection.execute(
+            "SELECT 1 FROM settings WHERE key='firstAdminProvisionedAt'").fetchone():
+        raise ValueError("First-admin provisioning already recorded; missing users require recovery review.")
+
+
+def existing_admin(connection):
+    verify_database(connection)
+    if not connection.execute(
+            "SELECT 1 FROM settings WHERE key='firstAdminProvisionedAt'").fetchone():
+        raise ValueError("First-admin completion marker missing; recovery review required.")
+    admins = connection.execute("SELECT username FROM users WHERE role='admin'").fetchall()
+    if len(admins) != 1:
+        raise ValueError("Expected exactly one existing application administrator; recovery review required.")
+    return admins[0][0]
+
+
+def reset_admin_password(connection, username, password, use_default_admin=False):
+    validate_fields(username, password, "Password reset")
+    if connection.in_transaction:
+        raise ValueError("Use a connection without a caller transaction.")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if existing_admin(connection) != username:
+            raise ValueError("Application administrator changed; reset aborted.")
+        target_username = "admin" if use_default_admin else username
+        if connection.execute("SELECT 1 FROM users WHERE lower(trim(username))=lower(?) AND username<>?",
+                              (target_username, username)).fetchone():
+            raise ValueError("The admin username is already used by another account; recovery review required.")
+        cursor = connection.execute("UPDATE users SET username=?,password=? WHERE username=? AND role='admin'",
+                                    (target_username, password, username))
+        if cursor.rowcount != 1:
+            raise ValueError("Expected application administrator was not updated.")
+        connection.execute("INSERT INTO audit_logs(category,user,type,text) VALUES (?,?,?,?)",
+                           ("AUTH", target_username, "warning",
+                            ("Application administrator renamed to the fixed admin username and password reset; "
+                             if target_username != username else
+                             "Existing application administrator password reset; ")
+                            + "locally authorized maintenance preserved role, site and tablet enrollment."))
+        connection.commit()
+    except (ValueError, sqlite3.Error, KeyboardInterrupt):
+        connection.rollback()
+        raise
+    return {"role": "admin", "password_reset": True, "username_changed": target_username != username,
+            "tablet_enrollment_changed": False}
+
+
+def create_first_admin(connection, username, password, site):
+    validate_fields(username, password, site)
+    if connection.in_transaction:
+        raise ValueError("Use a connection without a caller transaction.")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        verify_empty_database(connection)
+        connection.execute("INSERT INTO users(username,password,role) VALUES (?,?,?)",
+                           (username, password, "admin"))
+        cursor = connection.execute("UPDATE settings SET value=? WHERE key='siteName'", (site,))
+        if cursor.rowcount != 1:
+            raise ValueError("Provisioned siteName setting is missing.")
+        connection.execute(
+            "INSERT INTO settings(key,value) VALUES ('firstAdminProvisionedAt',?)",
+            (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),))
+        connection.execute(
+            "INSERT INTO audit_logs(category,user,type,text) VALUES (?,?,?,?)",
+            ("AUTH", username, "success",
+             "First application administrator created through locally authorized commissioning; "
+             "no Linux account or tablet was created."))
+        connection.commit()
+    except (ValueError, sqlite3.Error, KeyboardInterrupt):
+        connection.rollback()
+        raise
+    return {"app_user": username, "role": "admin", "site_name": site,
+            "linux_user_created": False, "tablet_registered": False,
+            "app_flows_active": False, "ready_for_deployment": False}
+
+
+def install(reset_password=False, use_default_admin=False):
+    if os.geteuid() != 0:
+        raise ValueError("Run locally with sudo under your existing Linux maintenance account.")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Interactive authenticated terminal required; passwords cannot be piped.")
+    model = Path("/proc/device-tree/model").read_text().strip("\0")
+    if not model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")) or (
+            Path("/dev/piControl0").exists()):
+        raise ValueError("Only the spare Raspberry Pi target is supported; working RevPi excluded.")
+    identity = pwd.getpwnam("gatekeeper")
+    if FOUNDATION.is_symlink():
+        raise ValueError("Unexpected foundation symlink.")
+    foundation = json.loads(FOUNDATION.read_text())
+    if reset_password:
+        if not any(n.get("id") == "login_guard" for n in foundation) or any(
+                n["type"] in ("http in", "http response", "exec", "tcp request") or
+                n["type"].startswith(("ui_", "revpi-")) for n in foundation):
+            raise ValueError("Password reset requires the spare Pi's reviewed login-only deployment.")
+    elif [node.get("type") for node in foundation] != ["tab", "inject"] or (
+            foundation[1].get("wires") != [[]] or foundation[1].get("repeat") != "60"):
+        raise ValueError("First-admin setup requires only the inactive-app idle foundation.")
+    metadata = DATABASE.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != identity.pw_uid or (
+            metadata.st_gid != identity.pw_gid or stat.S_IMODE(metadata.st_mode) != 0o600):
+        raise ValueError("Database must be a regular service-owned file with mode 0600.")
+    source = sqlite3.connect(f"{DATABASE.as_uri()}?mode=ro", uri=True)
+    try:
+        if reset_password:
+            username = existing_admin(source)
+            print(f"Existing application administrator username: {username}")
+            if use_default_admin:
+                print("Application login username after recovery: admin")
+                print("Renames this application account and resets its password; role, site and tablet are unchanged.")
+            else:
+                print("Resets only this application's password; role, site and enrolled tablet remain unchanged.")
+            print("The backend will restart to revoke cached logins and reload the password.")
+            site = "Password reset"
+        else:
+            verify_empty_database(source)
+            print("Creates the first APP administrator only; Linux account, MQTT identities and flows are unchanged.")
+            username = "admin"
+            print("Application login username: admin (fixed; do not enter a username at the password prompt).")
+            site = input("Site name: ").strip()
+        print("Current backend stores app passwords directly in protected SQLite. Production hash migration remains pending.")
+        password = getpass.getpass("New app password (12-128 characters): ")
+        repeated = getpass.getpass("Repeat app password: ")
+        if password != repeated:
+            raise ValueError("Passwords do not match; no account created.")
+        validate_fields(username, password, site)
+        confirmation = ("RESET-APP-ADMIN" if use_default_admin else "RESET-APP-PASSWORD") if reset_password else "CREATE-APP-ADMIN"
+        if input(f"Type {confirmation} to confirm: ").strip() != confirmation:
+            raise ValueError("Cancelled; no account created.")
+        if BACKUPS.is_symlink():
+            raise ValueError("Unexpected backup directory symlink.")
+        BACKUPS.mkdir(mode=0o700, exist_ok=True)
+        directory = BACKUPS.stat()
+        if directory.st_uid != 0 or stat.S_IMODE(directory.st_mode) != 0o700:
+            raise ValueError("Backup directory must be root-owned mode 0700.")
+        backup = BACKUPS / f"system.db.pre-{'password-reset' if reset_password else 'first-admin'}-{time.time_ns()}"
+        descriptor = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        target = sqlite3.connect(backup)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+        print(f"Consistent application database backup: {backup}")
+    finally:
+        source.close()
+    if reset_password:
+        subprocess.run(["systemctl", "stop", "gatekeeper-backend.service"],
+                       check=True, capture_output=True, timeout=60)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            child = os.fork()
+            if child == 0:
+                try:
+                    write_as_service(identity, metadata, username, password, site,
+                                     reset_password=True, use_default_admin=use_default_admin)
+                except (OSError, ValueError, sqlite3.Error, KeyboardInterrupt) as error:
+                    print(f"Password reset failed: {error}", file=sys.stderr, flush=True)
+                    os._exit(2)
+                os._exit(0)
+            try:
+                _, status = os.waitpid(child, 0)
+            except KeyboardInterrupt:
+                os.waitpid(child, 0)
+                raise
+            if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise ValueError("Service-owned password reset failed; inspect the backup and local error.")
+        finally:
+            subprocess.run(["systemctl", "start", "gatekeeper-backend.service"],
+                           check=True, capture_output=True, timeout=60)
+        subprocess.run(["systemctl", "is-active", "gatekeeper-backend.service"],
+                       check=True, capture_output=True, timeout=60)
+        return {"role": "admin", "password_reset": True,
+                "username_changed": use_default_admin and username != "admin",
+                "tablet_enrollment_changed": False, "backend_restarted": True}
+    return write_as_service(identity, metadata, username, password, site)
+
+
+def write_as_service(identity, metadata, username, password, site, reset_password=False, use_default_admin=False):
+    # SQLite writes and journals use the runtime identity, not root.
+    os.setgroups([])
+    os.setgid(identity.pw_gid)
+    os.setuid(identity.pw_uid)
+    current = DATABASE.lstat()
+    if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise ValueError("Database identity changed; aborting.")
+    connection = sqlite3.connect(f"{DATABASE.as_uri()}?mode=rw", uri=True)
+    try:
+        if reset_password:
+            return reset_admin_password(connection, username, password, use_default_admin=use_default_admin)
+        return create_first_admin(connection, username, password, site)
+    finally:
+        connection.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reset-password", action="store_true", help="Reset the sole existing app admin locally; preserve enrollment.")
+    parser.add_argument("--use-default-admin", action="store_true",
+                        help="With --reset-password, rename the existing app administrator to admin.")
+    args = parser.parse_args()
+    if args.use_default_admin and not args.reset_password:
+        parser.error("--use-default-admin requires --reset-password.")
+    os.umask(0o077)
+    try:
+        result = install(reset_password=args.reset_password, use_default_admin=args.use_default_admin)
+    except (OSError, ValueError, sqlite3.Error, KeyError, EOFError, subprocess.SubprocessError) as error:
+        print(f"App-admin maintenance failed: {error}. Inspect any reported backup and service/database state.", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("First-admin setup interrupted; check user count before retrying.", file=sys.stderr)
+        return 130
+    print(json.dumps(result, indent=2))
+    print("App admin created. No device enrollment or application flows activated.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

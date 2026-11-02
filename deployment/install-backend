@@ -1,0 +1,92 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+trap 'printf "ERROR: backend stage failed at line %s. Inspect output; no commissioning is implied.\n" "$LINENO" >&2' ERR
+
+[[ $EUID -eq 0 ]] || fail "Run this reviewed installer locally with sudo."
+[[ $# -eq 0 ]] || fail "This fresh-install foundation takes no arguments."
+source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+for file in package.json package-lock.json settings.js gatekeeper-backend.service foundation-flows.json candidate-flows.json manifest.json; do
+    [[ -f "$source_dir/$file" && ! -L "$source_dir/$file" ]] || fail "Missing/unsafe bundle file: $file"
+done
+[[ -r /etc/os-release ]] || fail "OS release unavailable."
+. /etc/os-release
+[[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13 ]] || fail "Require Debian 13 Trixie."
+[[ "$(dpkg --print-architecture)" == arm64 ]] || fail "Require arm64."
+model="$(tr -d '\0' < /proc/device-tree/model)"
+[[ "$model" == "Raspberry Pi 4 Model B"* || "$model" == "Raspberry Pi 5 Model B"* ]] || fail "Pi 4/5 only for this foundation."
+[[ ! -e /dev/piControl0 && ! -d /sys/class/piControl ]] || fail "Do not run this fresh Pi installer on the working RevPi."
+for path in /opt/gatekeeper-backend /etc/gatekeeper /var/lib/gatekeeper /etc/systemd/system/gatekeeper-backend.service; do
+    [[ ! -e "$path" && ! -L "$path" ]] || fail "Existing installation at $path; upgrade/resume is not implemented. Do not delete it blindly."
+done
+! getent passwd gatekeeper >/dev/null || fail "Account gatekeeper already exists; review its ownership before installing."
+! getent group gatekeeper >/dev/null || fail "Group gatekeeper already exists; review before installing."
+for unit in nodered.service gatekeeper-backend.service mosquitto.service; do
+    state="$(systemctl show "$unit" -p LoadState --value)"
+    [[ "$state" == not-found ]] || fail "Existing $unit must be reviewed; this is a fresh-system installer."
+done
+printf '%s\n' \
+    "Fresh spare Pi backend foundation:" \
+    "- Install Node.js/npm, SQLite and a loopback-only broker." \
+    "- Create locked gatekeeper service account; no sudo permission." \
+    "- Install frozen npm dependencies as an unprivileged account." \
+    "- Disable all Node-RED HTTP access; start only an idle timer with no outputs." \
+    "- Candidate app-only flows remain inactive; no TLS or tablet enrollment yet." \
+    "- No Ethernet, HDMI, password or autologin configuration is changed."
+read -r -p "Type INSTALL-EMPTY-BACKEND to continue: " confirmation
+[[ "$confirmation" == INSTALL-EMPTY-BACKEND ]] || fail "Cancelled."
+
+apt-get update
+apt-get install -y nodejs npm sqlite3 mosquitto mosquitto-clients net-tools build-essential libsqlite3-dev openssl
+# The stock Debian broker is loopback-only. Stop it while replacing its fresh configuration.
+systemctl stop mosquitto.service
+install -d -o root -g root -m 0755 /etc/mosquitto/gatekeeper-backups
+cp -p -- /etc/mosquitto/mosquitto.conf /etc/mosquitto/gatekeeper-backups/mosquitto.conf.pre-gatekeeper
+[[ -z "$(find /etc/mosquitto/conf.d -maxdepth 1 -name '*.conf' -print -quit)" ]] || fail "Unexpected broker snippets; broker stopped for review."
+printf '%s\n' \
+    'pid_file /run/mosquitto/mosquitto.pid' \
+    'user mosquitto' \
+    'persistence true' \
+    'persistence_location /var/lib/mosquitto/' \
+    'log_dest syslog' \
+    'listener 1883 127.0.0.1' \
+    'allow_anonymous true' \
+    > /etc/mosquitto/mosquitto.conf
+chmod 0644 /etc/mosquitto/mosquitto.conf
+adduser --system --group --home /var/lib/gatekeeper --no-create-home --shell /usr/sbin/nologin gatekeeper
+install -d -o root -g root -m 0755 /opt/gatekeeper-backend
+install -d -o root -g gatekeeper -m 0750 /etc/gatekeeper
+install -d -o gatekeeper -g gatekeeper -m 0700 /var/lib/gatekeeper
+install -o root -g gatekeeper -m 0640 "$source_dir/settings.js" /etc/gatekeeper/settings.js
+openssl rand -hex 32 > /etc/gatekeeper/credential-secret
+chown root:gatekeeper /etc/gatekeeper/credential-secret
+chmod 0640 /etc/gatekeeper/credential-secret
+install -o root -g gatekeeper -m 0640 "$source_dir/candidate-flows.json" /etc/gatekeeper/candidate-flows.json
+install -o root -g gatekeeper -m 0640 "$source_dir/manifest.json" /etc/gatekeeper/manifest.json
+install -o root -g root -m 0644 "$source_dir/gatekeeper-backend.service" /etc/systemd/system/gatekeeper-backend.service
+# npm lifecycle scripts must not execute as root.
+install -d -o gatekeeper -g gatekeeper -m 0700 /var/lib/gatekeeper/build
+install -o gatekeeper -g gatekeeper -m 0600 "$source_dir/package.json" "$source_dir/package-lock.json" /var/lib/gatekeeper/build/
+runuser -u gatekeeper -- sh -c 'cd /var/lib/gatekeeper/build && npm ci --omit=dev --no-audit --no-fund'
+cp -a /var/lib/gatekeeper/build/. /opt/gatekeeper-backend/
+chown -R root:root /opt/gatekeeper-backend
+chmod -R a+rX /opt/gatekeeper-backend
+chmod -R go-w /opt/gatekeeper-backend
+ln -s /opt/gatekeeper-backend/node_modules /var/lib/gatekeeper/node_modules
+install -o gatekeeper -g gatekeeper -m 0600 "$source_dir/foundation-flows.json" /var/lib/gatekeeper/flows.json
+systemctl daemon-reload
+systemctl enable --now mosquitto.service gatekeeper-backend.service
+systemctl is-active --quiet mosquitto.service gatekeeper-backend.service
+sleep 3
+systemctl is-active --quiet gatekeeper-backend.service
+if ss -ltnH | awk '{print $4}' | grep -Eq '(^|:)(1880|8883)$'; then
+    systemctl stop gatekeeper-backend.service
+    fail "Unexpected HTTP/TLS listener. Backend stopped; inspect before continuing."
+fi
+ss -ltnH | awk '{print $4}' | grep -qx '127.0.0.1:1883' || fail "Expected loopback broker listener missing."
+printf '%s\n' \
+    "Foundation installed: idle timer only, no Node-RED web endpoint, loopback MQTT only." \
+    "NOT commissioned: no TLS tablet listener, database, app admin or enrollment." \
+    "Candidate flow file has NOT been activated. Keep gate hardware disconnected."

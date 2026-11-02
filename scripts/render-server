@@ -1,0 +1,19 @@
+#!/usr/bin/python3
+"""Render host-specific server flows for review; does not install or activate."""
+
+import argparse
+from pathlib import Path
+
+from server_source import render_file
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("destination", type=Path)
+    args = parser.parse_args()
+    try:
+        digest = render_file(args.destination, args.host)
+    except (OSError, ValueError, KeyError) as error:
+        parser.exit(1, "ERROR: " + str(error) + "\n")
+    print("Rendered only; no installation or PLC commands. SHA256: " + digest)

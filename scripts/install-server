@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+"""Fresh, interactive Raspberry Pi installation. Never overwrites an existing server."""
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+from server_source import ROOT, render_file, validate_host
+
+
+EXISTING_PATHS = (
+    "/opt/gatekeeper-backend", "/opt/gatekeeper-network", "/opt/gatekeeper-server-tools",
+    "/etc/gatekeeper", "/var/lib/gatekeeper", "/var/lib/gatekeeper-management",
+    "/var/lib/gatekeeper-control", "/etc/systemd/system/gatekeeper-backend.service",
+    "/etc/dnsmasq.d/ot-network.conf",
+)
+FRESH_UNITS = ("nodered.service", "gatekeeper-backend.service", "gatekeeper-control.service",
+               "mosquitto.service", "dnsmasq.service", "gatekeeper-network-static.service",
+               "gatekeeper-reference-management.service")
+NETWORK_HELPERS = ("gatekeeper-network-service", "gatekeeper_interfaces.py",
+                   "revpi-network", "revpi-management")
+
+
+def run(*args, capture=False, input=None):
+    result = subprocess.run(args, text=True, input=input,
+                            capture_output=capture, check=True, timeout=1800)
+    return result.stdout.strip() if capture else None
+
+
+def load(relative, name):
+    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / relative))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def require_fresh(host):
+    if sys.platform != "linux" or os.geteuid() != 0 or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Run sudo bash install.sh in an interactive Pi maintenance terminal.")
+    model = Path("/proc/device-tree/model").read_text().rstrip("\0")
+    release = dict(line.split("=", 1) for line in Path("/etc/os-release").read_text().splitlines()
+                   if "=" in line and not line.startswith("#"))
+    if (not model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")) or
+            Path("/dev/piControl0").exists() or Path("/sys/class/piControl").exists() or
+            release.get("ID", "").strip('"') != "debian" or
+            release.get("VERSION_ID", "").strip('"') != "13" or
+            run("dpkg", "--print-architecture", capture=True) != "arm64"):
+        raise ValueError("Raspberry Pi OS Lite Trixie (Debian 13), arm64, Pi 4/5 required; RevPi excluded.")
+    for path in EXISTING_PATHS:
+        if Path(path).exists() or Path(path).is_symlink():
+            raise ValueError("Existing/partial installation: " + path +
+                             ". Nothing overwritten; use the existing server or review recovery.")
+    import grp
+    import pwd
+    for lookup in (pwd.getpwnam, grp.getgrnam):
+        try:
+            lookup("gatekeeper")
+        except KeyError:
+            continue
+        raise ValueError("Existing gatekeeper account/group; fresh installation refused.")
+    for unit in FRESH_UNITS:
+        if run("systemctl", "show", unit, "-p", "LoadState", "--value", capture=True) != "not-found":
+            raise ValueError("Existing service requires review: " + unit)
+    if run("systemctl", "is-active", "NetworkManager.service", capture=True) != "active":
+        raise ValueError("Configure and verify NetworkManager management access first.")
+    interfaces = load("scripts/gatekeeper_interfaces.py", "fresh_interface_preflight")
+    if len(interfaces.inventory()) < 2:
+        raise ValueError("Two distinct physical Ethernet adapters are required before installing.")
+    if host.endswith(".local") and host != socket.gethostname().split(".")[0].lower() + ".local":
+        raise ValueError("For .local discovery, --host must match this Pi's hostname + .local. "
+                         "Set the unique Pi hostname in Raspberry Pi Imager before installation.")
+    for path in ("/etc/systemd/system/dnsmasq.service", "/run/systemd/system/dnsmasq.service"):
+        if Path(path).exists() or Path(path).is_symlink():
+            raise ValueError("Existing dnsmasq override/mask requires review: " + path)
+
+
+def protect_copy(source):
+    destination = Path(tempfile.mkdtemp(prefix="gatekeeper-server-install-", dir="/root"))
+    files = [source / "install.sh"]
+    for folder in ("scripts", "deployment", "docs"):
+        files.extend(path for path in sorted((source / folder).rglob("*")) if not path.is_dir())
+    hashes = {}
+    for path in files:
+        relative = path.relative_to(source)
+        if "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Unsafe installer input: " + str(relative))
+        target = destination / relative
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        data = path.read_bytes()
+        target.write_bytes(data)
+        target.chmod(0o644)
+        hashes[relative.as_posix()] = hashlib.sha256(data).hexdigest()
+    (destination / "source-manifest.json").write_text(json.dumps(hashes, indent=2) + "\n")
+    (destination / "source-manifest.json").chmod(0o600)
+    return destination
+
+
+def require_protected(root):
+    for path in (root, *root.parents, *root.rglob("*")):
+        info = path.lstat()
+        if path.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022 or not (
+                stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise ValueError("Unsafe protected installer path: " + str(path))
+    hashes = json.loads((root / "source-manifest.json").read_text())
+    actual = {path.relative_to(root).as_posix() for path in root.rglob("*")
+              if path.is_file() and path.name != "source-manifest.json"}
+    if actual != set(hashes):
+        raise ValueError("Protected installer inventory mismatch.")
+    for relative, digest in hashes.items():
+        if hashlib.sha256((root / relative).read_bytes()).hexdigest() != digest:
+            raise ValueError("Protected installer hash mismatch: " + relative)
+
+
+def install_file(source, destination, uid=0, gid=0, mode=0o644):
+    destination = Path(destination)
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("Refusing to overwrite: " + str(destination))
+    with destination.open("xb") as stream:
+        stream.write(source.read_bytes())
+        stream.flush()
+        os.fchown(stream.fileno(), uid, gid)
+        os.fchmod(stream.fileno(), mode)
+        os.fsync(stream.fileno())
+
+
+def encrypt_credentials():
+    return """
+const fs=require('fs'),crypto=require('crypto');
+const secret=fs.readFileSync('/etc/gatekeeper/credential-secret','utf8').trim();
+const password=fs.readFileSync('/etc/gatekeeper/manager-password','utf8').trim();
+const key=crypto.createHash('sha256').update(secret).digest();
+const iv=crypto.randomBytes(16),cipher=crypto.createCipheriv('aes-256-ctr',key,iv);
+const data=JSON.stringify({tablet_dynsec_broker:{user:'gatekeeper_dynsec_manager',password}});
+const encrypted=Buffer.concat([cipher.update(data,'utf8'),cipher.final()]);
+fs.writeFileSync('/var/lib/gatekeeper/flows_cred.json',
+JSON.stringify({$:iv.toString('hex')+encrypted.toString('base64')}),{mode:0o600,flag:'wx'});
+"""
+
+
+def install_platform():
+    destination = Path("/opt/gatekeeper-network")
+    destination.mkdir(mode=0o755)
+    destination.chmod(0o755)
+    for name in NETWORK_HELPERS:
+        install_file(ROOT / "scripts" / name, destination / name)
+    for directory in ("/etc/dnsmasq.d", "/var/lib/misc", "/var/lib/gatekeeper-management"):
+        path = Path(directory)
+        if path.is_symlink():
+            raise ValueError("Unexpected platform directory symlink: " + directory)
+        if not path.exists():
+            path.mkdir(mode=0o755)
+            path.chmod(0o755)
+    install_file(ROOT / "deployment/gatekeeper-network-static.service",
+                 "/etc/systemd/system/gatekeeper-network-static.service")
+    dropin = Path("/etc/systemd/system/gatekeeper-network-static.service.d")
+    dropin.mkdir(mode=0o755)
+    dropin.chmod(0o755)
+    install_file(ROOT / "deployment/gatekeeper-reference-platform.conf", dropin / "95-reference-app.conf")
+    install_file(ROOT / "deployment/gatekeeper-reference-management.service",
+                 "/etc/systemd/system/gatekeeper-reference-management.service")
+    tools = Path("/opt/gatekeeper-server-tools")
+    tools.mkdir(mode=0o755)
+    tools.chmod(0o755)
+    for name in ("gatekeeper-console", "gatekeeper-enroll", "gatekeeper_plc_read.py"):
+        install_file(ROOT / "scripts" / name, tools / name)
+    run("systemctl", "daemon-reload")
+    run("systemctl", "enable", "--now", "gatekeeper-network-static.service",
+        "gatekeeper-reference-management.service")
+    run("systemctl", "is-active", "--quiet", "gatekeeper-network-static.service",
+        "gatekeeper-reference-management.service")
+
+
+def execute(args):
+    import pwd
+    import sqlite3
+    os.umask(0o077)
+    require_protected(ROOT)
+    require_fresh(args.host)
+    stage_path = ROOT / "install-state.json"
+
+    def stage(name):
+        stage_path.write_text(json.dumps({"stage": name, "host": args.host,
+                                        "at": time.time(), "complete": False}) + "\n")
+        stage_path.chmod(0o600)
+        print("\n== " + name + " ==", flush=True)
+
+    deployment = ROOT / "deployment"
+    shutil.copyfile(deployment / "foundation-flows.json", deployment / "candidate-flows.json")
+    (deployment / "manifest.json").write_text(json.dumps({"profile": "idle-foundation-only"}) + "\n")
+    try:
+        stage("Empty backend foundation")
+        run("/bin/bash", str(deployment / "install-backend"))
+        stage("Platform dependencies (DHCP server held inactive)")
+        run("systemctl", "mask", "--runtime", "dnsmasq.service")
+        run("apt-get", "install", "-y", "--no-install-recommends", "dnsmasq", "iproute2",
+            "iputils-arping", "qrencode", "avahi-daemon", "libnss-mdns")
+        run("systemctl", "unmask", "--runtime", "dnsmasq.service")
+        run("systemctl", "disable", "--now", "dnsmasq.service")
+        run("systemctl", "enable", "--now", "avahi-daemon.service")
+        stage("Confirm physical Ethernet roles")
+        run(sys.executable, "-B", str(deployment / "install-interface-roles"))
+        stage("Static isolated gate link")
+        run(sys.executable, "-B", str(deployment / "install-gate-static"))
+        stage("Unique TLS identity and empty SQLite database")
+        provision = load("scripts/gatekeeper-provision", "fresh_provision")
+        plugins = list(Path("/usr/lib").glob("*/mosquitto_dynamic_security.so"))
+        if len(plugins) != 1:
+            raise ValueError("Exactly one Mosquitto Dynamic Security plugin required.")
+        provision.install(args.host, plugins[0])
+        network = load("scripts/revpi-network", "fresh_network")
+        interfaces = network.interfaces
+        address_rows = json.loads(network.run(
+            "ip", "-j", "-4", "addr", "show", "dev", interfaces.resolve("gate")))
+        addresses = [entry["local"] for device in address_rows for entry in device["addr_info"]
+                     if entry.get("family") == "inet"]
+        if len(addresses) != 1:
+            raise ValueError("Expected one static gate address.")
+        with sqlite3.connect("/var/lib/gatekeeper/system.db") as database:
+            database.execute("INSERT INTO settings(key,value) VALUES('dhcpConf',?)", (
+                json.dumps({"interface": "lan1", "masterMode": "client",
+                            "clientMode": "static", "staticIp": addresses[0]}),))
+        stage("Create first application administrator")
+        run(sys.executable, "-B", str(ROOT / "scripts/gatekeeper-first-admin"))
+        if not args.no_editor:
+            stage("Separate localhost-only HTTPS maintenance editor")
+            run(sys.executable, "-B", str(deployment / "install-editor"))
+        if not args.skip_hdmi:
+            stage("HDMI console boot settings (reboot required)")
+            hdmi = load("scripts/gatekeeper-install", "fresh_hdmi")
+            hdmi.configure_hdmi(hdmi.Inventory(), "raspberry-pi-trixie-arm64",
+                                args.hdmi_connector, "1280x720@60")
+        stage("Install selected server flow and local enrollment tools")
+        run("systemctl", "stop", "gatekeeper-backend.service")
+        account = pwd.getpwnam("gatekeeper")
+        current = Path("/var/lib/gatekeeper/flows.json")
+        foundation = json.loads((deployment / "foundation-flows.json").read_text())
+        if json.loads(current.read_text()) != foundation:
+            raise ValueError("Foundation changed during installation; keeping backend stopped.")
+        rendered = ROOT / "server-flows.json"
+        render_file(rendered, args.host)
+        run("node", "-", input=encrypt_credentials())
+        os.chown("/var/lib/gatekeeper/flows_cred.json", account.pw_uid, account.pw_gid)
+        backup = Path("/etc/gatekeeper/foundation-flows.json")
+        install_file(current, backup, 0, account.pw_gid, 0o640)
+        descriptor, temporary = tempfile.mkstemp(prefix=".server-flows-", dir=current.parent)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(rendered.read_bytes())
+            os.fchown(stream.fileno(), account.pw_uid, account.pw_gid)
+            os.fchmod(stream.fileno(), 0o600)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, current)
+        install_platform()
+        install_file(ROOT / "source-manifest.json", "/etc/gatekeeper/source-manifest.json",
+                     0, account.pw_gid, 0o640)
+        stage_path.write_text(json.dumps({"stage": "Installed; awaiting deliberate start and acceptance",
+                                         "host": args.host, "complete": True}) + "\n")
+        print("\nServer installed with no registered gates. Backend remains STOPPED.")
+        print("Start: sudo systemctl start gatekeeper-backend.service")
+        print("If HDMI was configured, reboot when ready and verify the local console.")
+        print("At HDMI: sudo python3 -B /opt/gatekeeper-server-tools/gatekeeper-enroll")
+        print("Follow docs/FIRST-TABLET.md. Register real discovered gates only after enrollment/login.")
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt, EOFError):
+        if Path("/etc/systemd/system/gatekeeper-backend.service").exists():
+            print("Installation incomplete: stopping backend. Keep all generated keys/data for review.",
+                  file=sys.stderr)
+            run("systemctl", "stop", "gatekeeper-backend.service")
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default=socket.gethostname().split(".")[0] + ".local")
+    parser.add_argument("--plan", action="store_true", help="Print steps only; never installs or changes services.")
+    parser.add_argument("--no-editor", action="store_true")
+    parser.add_argument("--skip-hdmi", action="store_true")
+    parser.add_argument("--hdmi-connector", choices=("HDMI-A-1", "HDMI-A-2"), default="HDMI-A-1")
+    parser.add_argument("--protected", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    try:
+        args.host = validate_host(args.host)
+        if args.plan:
+            print("Fresh Pi 4/5; Raspberry Pi OS Lite Trixie arm64; host: " + args.host)
+            print("Refuses existing/partial installs. Does not upgrade the working .174 server.")
+            print("Foundation -> dependencies -> Ethernet roles -> static gate IP -> TLS/SQLite -> app admin")
+            print("-> optional HTTPS editor -> HDMI -> selected reference flow -> backend STOPPED.")
+            print("Unique secrets generated on the Pi. No demo gates/site data shipped. No changes made.")
+            return 0
+        if args.protected:
+            execute(args)
+        else:
+            require_fresh(args.host)
+            if input("Type INSTALL-FRESH-GATEKEEPER: ").strip() != "INSTALL-FRESH-GATEKEEPER":
+                raise ValueError("Cancelled; nothing installed.")
+            destination = protect_copy(ROOT)
+            print("Protected installer copy: " + str(destination), flush=True)
+            return subprocess.run(
+                [sys.executable, "-B", str(destination / "scripts/install-server"),
+                 *sys.argv[1:], "--protected"], check=False).returncode
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError,
+            KeyboardInterrupt, EOFError) as error:
+        parser.exit(1, "ERROR: Fresh install stopped: " + str(error) +
+                    "\nDo not rerun over partial output or delete keys/database. Review the printed stage locally.\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

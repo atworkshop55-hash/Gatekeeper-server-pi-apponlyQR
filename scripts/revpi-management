@@ -1,0 +1,383 @@
+#!/usr/bin/python3
+"""LAN0 management configuration and DHCP recovery monitor."""
+
+import base64
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import gatekeeper_interfaces as interfaces
+
+
+ROOT = Path("/var/lib/gatekeeper-management")
+STATE = ROOT / "state.json"
+STATUS = ROOT / "status.json"
+LOCK = ROOT / "lock"
+DEFAULT = {"mode": "dhcp", "fallback": "192.168.250.1/24",
+           "address": "", "gateway": "", "dns": []}
+KEYS = ("ipv4.method", "ipv4.addresses", "ipv4.gateway", "ipv4.dns",
+        "ipv4.ignore-auto-dns", "ipv4.never-default", "ipv4.may-fail",
+        "ipv4.dhcp-timeout", "connection.autoconnect", "connection.interface-name")
+ERRORS = (OSError, RuntimeError, ValueError, subprocess.SubprocessError)
+
+
+def run(*args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=40)
+    if result.returncode:
+        raise RuntimeError(f"{' '.join(args[:3])}: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout.strip()
+
+
+def write(path, value):
+    descriptor, temporary = tempfile.mkstemp(dir=ROOT)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(value, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644 if path == STATUS else 0o600)
+        os.replace(temporary, path)
+        directory = os.open(ROOT, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def read(path):
+    value = json.loads(path.read_text()) if path.exists() else None
+    if path == STATE and value and interfaces.read_mapping() is not None and value.get("interface") != interface():
+        raise ValueError("Management interface name changed; review saved recovery/profile state before applying.")
+    return value
+
+
+def interface():
+    return interfaces.resolve("management")
+
+
+def unicast(value):
+    address = ipaddress.IPv4Address(value)
+    if address.is_multicast or address.is_loopback or address.is_unspecified or address.is_reserved:
+        raise ValueError("Use a unicast IPv4 address.")
+    if int(address) >> 24 == 0 or address.is_link_local:
+        raise ValueError("Do not use a zero-network or link-local address.")
+    return address
+
+
+def host(value):
+    if "/" not in str(value):
+        raise ValueError("Include an IPv4 prefix, for example 192.168.250.1/24.")
+    address = ipaddress.IPv4Interface(value)
+    unicast(str(address.ip))
+    if not 8 <= address.network.prefixlen <= 30 or address.ip in (
+            address.network.network_address, address.network.broadcast_address):
+        raise ValueError("Choose a usable host address with prefix /8 through /30.")
+    return address
+
+
+def validate(value):
+    if not isinstance(value, dict) or value.get("mode") not in ("dhcp", "static"):
+        raise ValueError("Choose DHCP with fallback or manual static addressing.")
+    interfaces.validate_request("management", value.get("interface", "lan0"))
+    config = dict(DEFAULT, mode=value["mode"], fallback=str(host(value.get("fallback", ""))))
+    if config["mode"] == "static":
+        address = host(value.get("address", ""))
+        gateway = value.get("gateway", "").strip()
+        if gateway:
+            gateway_ip = unicast(gateway)
+            if gateway_ip not in address.network or gateway_ip in (
+                    address.ip, address.network.network_address, address.network.broadcast_address):
+                raise ValueError("Gateway must be another usable address in the static subnet.")
+        dns = value.get("dns", [])
+        if not isinstance(dns, list) or len(dns) > 3:
+            raise ValueError("Enter up to three IPv4 DNS servers.")
+        config.update(address=str(address), gateway=gateway,
+                      dns=[str(unicast(item)) for item in dns])
+    return config
+
+
+def addresses(iface=None):
+    args = ("ip", "-j", "-4", "addr", "show")
+    return json.loads(run(*args, *(("dev", iface) if iface else ())))
+
+
+def no_overlap(cidr, iface):
+    network = host(cidr).network
+    for device in addresses():
+        if device["ifname"] in (iface, "lo"):
+            continue
+        for entry in device.get("addr_info", []):
+            other = ipaddress.IPv4Interface(f"{entry['local']}/{entry['prefixlen']}").network
+            if network.overlaps(other):
+                raise ValueError(f"{network} overlaps {device['ifname']} ({other}).")
+
+
+def collision_check(cidr, iface):
+    no_overlap(cidr, iface)
+    try:
+        run("arping", "-D", "-q", "-c", "3", "-w", "4", "-I", iface, str(host(cidr).ip))
+    except RuntimeError as error:
+        raise RuntimeError(f"Recovery/static address {cidr} cannot be used: conflict detected or ARP probe failed. {error}") from error
+
+
+def boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def link_up(iface):
+    devices = json.loads(run("ip", "-j", "link", "show", "dev", iface))
+    return bool(devices and "LOWER_UP" in devices[0].get("flags", []))
+
+
+def profile(iface):
+    active = run("nmcli", "-g", "GENERAL.CON-UUID", "device", "show", iface)
+    if not active or active == "--":
+        raise RuntimeError("LAN0 must have an active NetworkManager profile before changing settings.")
+    bound = run("nmcli", "-g", "connection.interface-name", "connection", "show", active)
+    if bound and bound != iface:
+        raise RuntimeError("Active management profile is bound to another interface.")
+    return active
+
+
+def activate(profile_id, settings, iface):
+    run("nmcli", "connection", "modify", profile_id,
+        *[item for pair in settings.items() for item in pair])
+    run("nmcli", "--wait", "0", "connection", "up", "uuid", profile_id, "ifname", iface)
+
+
+def adopt():
+    if read(STATE):
+        raise RuntimeError("Management configuration already exists; use apply instead.")
+    iface = interface()
+    profile_id = profile(iface)
+    if run("nmcli", "-g", "ipv4.method", "connection", "show", profile_id) != "auto":
+        raise RuntimeError("Only an existing DHCP profile can be adopted without reactivation.")
+    for key in ("ipv4.addresses", "ipv4.gateway", "ipv4.dns"):
+        if run("nmcli", "-g", key, "connection", "show", profile_id):
+            raise RuntimeError("Existing manual addresses, gateway or DNS require explicit apply.")
+    for key in ("ipv4.never-default", "ipv4.ignore-auto-dns"):
+        if run("nmcli", "-g", key, "connection", "show", profile_id) != "no":
+            raise RuntimeError("Existing routing/DNS policy requires explicit apply.")
+    current = [entry for device in addresses(iface) for entry in device.get("addr_info", [])]
+    if not any(entry.get("dynamic") for entry in current):
+        raise RuntimeError("A current DHCP lease is required for non-disruptive adoption.")
+    no_overlap(DEFAULT["fallback"], iface)
+    run("nmcli", "connection", "modify", profile_id,
+        "ipv4.dhcp-timeout", "2147483647", "connection.autoconnect", "yes",
+        "connection.interface-name", iface)
+    state = {"interface": iface, "profile": profile_id, "config": dict(DEFAULT), "events": []}
+    emit(state, "LAN0 existing DHCP configuration adopted for recovery monitoring; active address unchanged.", "success")
+    write(STATE, state)
+    return {"ok": True, "message": state["events"][-1]["message"]}
+
+
+def emit(state, message, kind):
+    state.setdefault("events", []).append({
+        "id": str(uuid.uuid4()), "at": int(time.time() * 1000),
+        "message": message, "type": kind,
+    })
+    state["events"] = state["events"][-50:]
+
+
+def apply(value):
+    config = validate(value)
+    iface = interface()
+    run("systemctl", "is-active", "--quiet", "gatekeeper-management.service")
+    if not Path("/usr/bin/arping").exists() and not Path("/usr/sbin/arping").exists():
+        raise RuntimeError("Install iputils-arping before enabling management recovery.")
+    state = read(STATE)
+    if state and state.get("pending"):
+        raise RuntimeError("Confirm the pending management change or wait for its rollback.")
+    no_overlap(config["fallback"], iface)
+    if config["mode"] == "static":
+        collision_check(config["address"], iface)
+    profile_id = profile(iface)
+    previous = {key: run("nmcli", "-g", key, "connection", "show", profile_id) for key in KEYS}
+    previous_config = state["config"] if state else None
+    state = state or {"events": []}
+    remove_fallback(state)
+    revision = str(uuid.uuid4())
+    state.update(config=config, interface=iface, profile=profile_id,
+                 pending={"id": revision, "deadline": time.time() + 180,
+                          "previous": previous, "config": previous_config,
+                          "boot": boot_id()})
+    # Persist recovery information before any command can interrupt management.
+    write(STATE, state)
+    settings = {
+        "ipv4.method": "auto" if config["mode"] == "dhcp" else "manual",
+        "ipv4.addresses": "" if config["mode"] == "dhcp" else config["address"],
+        "ipv4.gateway": config["gateway"], "ipv4.dns": ",".join(config["dns"]),
+        "ipv4.ignore-auto-dns": "no" if config["mode"] == "dhcp" else "yes",
+        "ipv4.never-default": "no", "ipv4.may-fail": "yes",
+        "ipv4.dhcp-timeout": "2147483647", "connection.autoconnect": "yes",
+        "connection.interface-name": iface,
+    }
+    try:
+        activate(profile_id, settings, iface)
+    except ERRORS:
+        rollback(state)
+        raise
+    emit(state, "LAN0 change staged; reconnect and confirm within 180 seconds or it will roll back.", "warning")
+    write(STATE, state)
+    return {"ok": True, "message": state["events"][-1]["message"],
+            "pendingId": revision, "config": config}
+
+
+def remove_fallback(state):
+    value = state.get("addedFallback")
+    if value:
+        current = [f"{entry['local']}/{entry['prefixlen']}"
+                   for device in addresses(state["interface"]) for entry in device.get("addr_info", [])]
+        if value in current:
+            run("ip", "addr", "del", value, "dev", state["interface"])
+        state.pop("addedFallback", None)
+
+
+def rollback(state):
+    pending = state["pending"]
+    remove_fallback(state)
+    activate(state["profile"], pending["previous"], state["interface"])
+    state["config"] = pending["config"]
+    state["pending"] = None
+    emit(state, "LAN0 change was not confirmed; previous management settings restored.", "warning")
+    write(STATE, state)
+
+
+def confirm(pending_id):
+    state = read(STATE)
+    if not state or not state.get("pending") or pending_id != state["pending"]["id"]:
+        raise ValueError("No matching pending management change.")
+    if time.time() >= state["pending"]["deadline"]:
+        raise ValueError("Confirmation expired; previous settings are being restored.")
+    status = read(STATUS)
+    age = time.time() * 1000 - status["sampledAt"] if status else None
+    if age is None or age < 0 or age > 15000 or status.get("error"):
+        raise RuntimeError("Fresh, healthy management status is required before confirming.")
+    if status.get("pendingId") != pending_id or status.get("state") not in ("dhcp", "static", "fallback"):
+        raise RuntimeError("Wait until the new management connection has an address.")
+    state["pending"] = None
+    emit(state, "LAN0 management settings confirmed and saved.", "success")
+    write(STATE, state)
+    return {"ok": True, "message": state["events"][-1]["message"], "config": state["config"]}
+
+
+def monitor_step(state, now, waiting_since):
+    iface, config = state["interface"], state["config"]
+    pending = state.get("pending")
+    boot = boot_id()
+    if pending and (time.time() >= pending["deadline"] or boot != pending["boot"]):
+        rollback(state)
+        config = state["config"]
+    if not config:
+        return "unmanaged", waiting_since, []
+    current = [entry for device in addresses(iface) for entry in device.get("addr_info", [])]
+    active = run("nmcli", "-g", "GENERAL.CON-UUID", "device", "show", iface)
+    if active not in (state["profile"], "", "--"):
+        raise RuntimeError("LAN0 active profile changed externally; recovery monitor will not overwrite it.")
+    if active in ("", "--") and link_up(iface) and time.time() >= state.get("nextActivation", 0):
+        run("nmcli", "--wait", "0", "connection", "up", "uuid", state["profile"], "ifname", iface)
+        state["nextActivation"] = time.time() + 60
+    fallback = host(config["fallback"])
+    lease = [entry["local"] for entry in current if entry.get("dynamic")]
+    if config["mode"] == "static":
+        if str(host(config["address"]).ip) not in [entry["local"] for entry in current]:
+            raise RuntimeError("LAN0 static address is not active.")
+        return "static", now, [entry["local"] for entry in current]
+    if lease:
+        if state.get("addedFallback"):
+            if str(fallback.ip) in lease:
+                state.pop("addedFallback", None)
+            else:
+                remove_fallback(state)
+            emit(state, "LAN0 DHCP lease obtained; recovery address removed.", "success")
+        return "dhcp", now, lease
+    if now - waiting_since >= 60:
+        if not state.get("addedFallback"):
+            if not link_up(iface):
+                return "waiting-link", waiting_since, []
+            collision_check(config["fallback"], iface)
+            run("ip", "addr", "add", config["fallback"], "dev", iface)
+            state["addedFallback"] = config["fallback"]
+            emit(state, f"LAN0 DHCP unavailable for 60 seconds; recovery address {config['fallback']} active.", "warning")
+        elif str(fallback.ip) not in [entry["local"] for entry in current]:
+            collision_check(config["fallback"], iface)
+            run("ip", "addr", "add", config["fallback"], "dev", iface)
+        return "fallback", waiting_since, [str(fallback.ip)]
+    return "waiting-dhcp", waiting_since, []
+
+
+def monitor():
+    waiting_since = time.monotonic()
+    revision = None
+    last_error = None
+    while True:
+        with LOCK.open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = read(STATE)
+            status = {"installed": True, "sampledAt": int(time.time() * 1000)}
+            if state:
+                marker = (state.get("config"), state.get("profile"))
+                if marker != revision:
+                    waiting_since, revision = time.monotonic(), marker
+                try:
+                    mode, waiting_since, ips = monitor_step(state, time.monotonic(), waiting_since)
+                    status.update(state=mode, addresses=ips, error=None)
+                    last_error = None
+                except ERRORS as error:
+                    message = str(error)
+                    status.update(state="error", addresses=[], error=message)
+                    if message != last_error:
+                        emit(state, "LAN0 recovery error: " + message, "error")
+                        print(message, file=sys.stderr, flush=True)
+                        last_error = message
+                write(STATE, state)
+                pending = state.get("pending") or {}
+                status.update(config=state.get("config"), interface=state["interface"],
+                              pendingId=pending.get("id"), deadline=pending.get("deadline"),
+                              events=state.get("events", []))
+            else:
+                iface = interface()
+                ips = [entry["local"] for device in addresses(iface)
+                       for entry in device.get("addr_info", [])]
+                status.update(state="unmanaged", config=None, interface=iface,
+                              addresses=ips, events=[])
+            write(STATUS, status)
+        time.sleep(5)
+
+
+def main():
+    if os.geteuid() != 0:
+        raise PermissionError("Management helper must run as root.")
+    ROOT.mkdir(mode=0o755, exist_ok=True)
+    if sys.argv[1:] == ["monitor"]:
+        monitor()
+        return
+    with LOCK.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if len(sys.argv) == 3 and sys.argv[1] == "apply":
+            value = json.loads(base64.b64decode(sys.argv[2], validate=True))
+            result = apply(value)
+        elif len(sys.argv) == 3 and sys.argv[1] == "confirm":
+            result = confirm(sys.argv[2])
+        elif sys.argv[1:] == ["adopt-dhcp"]:
+            result = adopt()
+        else:
+            raise ValueError("Use apply CONFIG_BASE64, confirm ID, adopt-dhcp, or monitor.")
+    print(json.dumps(result), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ERRORS as error:
+        print(json.dumps({"ok": False, "message": str(error)}), flush=True)
+        sys.exit(1)

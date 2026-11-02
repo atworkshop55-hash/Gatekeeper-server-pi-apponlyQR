@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+"""Locally confirm persistent Ethernet roles without changing networking."""
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pwd
+import subprocess
+import sys
+import tempfile
+
+
+SOURCE = Path(__file__).resolve().parent.parent / "scripts" / "gatekeeper_interfaces.py"
+spec = importlib.util.spec_from_file_location("gatekeeper_interfaces", SOURCE)
+interfaces = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(interfaces)
+
+
+def main():
+    if os.geteuid() != 0 or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Authenticated local sudo terminal required.")
+    model = Path("/proc/device-tree/model").read_text().strip("\0")
+    if not model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")) or Path("/dev/piControl0").exists():
+        raise ValueError("Spare Raspberry Pi only; working RevPi excluded.")
+    devices = interfaces.inventory()
+    for device in devices:
+        print(f"{device['name']}: MAC {device['mac']}, driver {device['driver']}")
+    management = input("Management/uplink interface: ").strip()
+    gate = input("Isolated gate interface: ").strip()
+    by_name = {device["name"]: device for device in devices}
+    if management == gate or management not in by_name or gate not in by_name:
+        raise ValueError("Choose two distinct physical Ethernet adapters from the list.")
+    interfaces.ensure_gate_not_management(gate)
+    value = {"version": 1, "roles": {
+        role: {key: by_name[name][key] for key in ("mac", "driver")}
+        for role, name in (("management", management), ("gate", gate))}}
+    interfaces.resolved_roles(value, devices)
+    destination = interfaces.MAPPING
+    existing = interfaces.read_mapping()
+    if existing is not None:
+        if existing == value:
+            print("Matching roles already installed; no files or networking changed.")
+            return
+        raise ValueError("Existing different roles require reviewed remapping; not overwritten.")
+    if input("Confirm gate switch is isolated: type ISOLATED-GATE-SWITCH: ").strip() != "ISOLATED-GATE-SWITCH":
+        raise ValueError("Cancelled.")
+    print("Save adapter roles only: no IP changes, DHCP, service restart or sudo policy change.")
+    if input("Type SAVE-ETHERNET-ROLES: ").strip() != "SAVE-ETHERNET-ROLES":
+        raise ValueError("Cancelled.")
+    account = pwd.getpwnam("gatekeeper")
+    info = destination.parent.lstat()
+    if destination.parent.is_symlink() or info.st_uid != 0 or info.st_mode & 0o777 != 0o750:
+        raise ValueError("Expected protected Gate Keeper configuration directory.")
+    descriptor, temporary = tempfile.mkstemp(prefix=".interface-roles-", dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chown(temporary, 0, account.pw_gid)
+        os.chmod(temporary, 0o640)
+        # Publish without overwriting a concurrently created mapping.
+        os.link(temporary, destination)
+        directory = os.open(destination.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print("Roles saved:", interfaces.resolved_roles(interfaces.read_mapping(), interfaces.inventory()))
+    print("Network helpers/app activation are separate and not installed by this role-only stage.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+scripts/* text eol=lf
+deployment/* text eol=lf

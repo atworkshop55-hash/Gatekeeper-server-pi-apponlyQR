@@ -1,0 +1,224 @@
+#!/usr/bin/python3
+"""Locally confirmed HTTPS Node-RED maintenance editor; SSH tunnel only."""
+
+import getpass
+import http.client
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import shutil
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+
+ROOT = Path("/etc/gatekeeper")
+
+
+def run(*args, input=None):
+    result = subprocess.run(args, input=input, capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError(f"{args[0]} failed (exit {result.returncode}); inspect locally.")
+    return result.stdout
+
+
+def validate_fields(username, password):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", username):
+        raise ValueError("Maintenance username must be 1-64 letters/digits/underscore/hyphen.")
+    if len(password) < 12 or len(password.encode("utf-8")) > 72 or password != password.strip() or any(
+            ord(c) < 32 or ord(c) == 127 for c in password):
+        raise ValueError("Use at least 12 characters, at most 72 UTF-8 bytes, without surrounding whitespace/control characters.")
+
+
+def protected(path, mode, uid):
+    info = path.lstat()
+    if path.is_symlink() or not path.is_file() or info.st_uid != uid or info.st_mode & 0o777 != mode:
+        raise ValueError(f"Unsafe or incorrectly owned file: {path}")
+
+
+def generate_material(stage, ca, ca_key, host, username, password):
+    validate_fields(username, password)
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", host):
+        raise ValueError("Invalid commissioned DNS hostname.")
+    password_hash = run("node", "-e", """
+const fs=require('fs');
+const bcrypt=require(require.resolve('bcryptjs',{paths:['/opt/gatekeeper-backend/node_modules/@node-red/editor-api']}));
+process.stdout.write(bcrypt.hashSync(JSON.parse(fs.readFileSync(0,'utf8')),12));
+""", input=json.dumps(password))
+    if not re.fullmatch(r"\$2[aby]\$12\$[./A-Za-z0-9]{53}", password_hash):
+        raise ValueError("Unexpected Node-RED bcrypt hash.")
+    run("openssl", "req", "-new", "-newkey", "rsa:3072", "-nodes",
+        "-keyout", str(stage / "server.key"), "-out", str(stage / "server.csr"),
+        "-subj", "/CN=Gate Keeper Maintenance")
+    extension = stage / "server.ext"
+    extension.write_text("basicConstraints=critical,CA:FALSE\n"
+                         "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                         "extendedKeyUsage=serverAuth\n"
+                         f"subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:{host}\n")
+    run("openssl", "x509", "-req", "-in", str(stage / "server.csr"),
+        "-CA", str(ca), "-CAkey", str(ca_key), "-set_serial", "0x" + secrets.token_hex(16),
+        "-out", str(stage / "server.crt"), "-days", "365", "-sha256",
+        "-extfile", str(extension))
+    run("openssl", "verify", "-CAfile", str(ca), "-verify_hostname", "localhost",
+        str(stage / "server.crt"))
+    (stage / "maintenance-editor.json").write_text(json.dumps({
+        "version": 1, "username": username, "passwordHash": password_hash
+    }) + "\n")
+    for name in ("server.key", "server.crt", "maintenance-editor.json"):
+        (stage / name).chmod(0o600)
+
+
+def request(port, ca, method, path, fields=None, token=None):
+    connection = http.client.HTTPSConnection(
+        "localhost", port, context=ssl.create_default_context(cafile=str(ca)), timeout=5)
+    try:
+        body = urllib.parse.urlencode(fields) if fields is not None else None
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        connection.request(method, path, body, headers)
+        response = connection.getresponse()
+        return response.status, response.read(100000)
+    finally:
+        connection.close()
+
+
+def install_material(stage, tls, config, gid):
+    tls.mkdir(mode=0o750)
+    os.chown(tls, 0, gid)
+    tls.chmod(0o750)
+    for name, target in (("server.key", tls / "server.key"), ("server.crt", tls / "server.crt"),
+                         ("maintenance-editor.json", config)):
+        shutil.copyfile(stage / name, target)
+        os.chown(target, 0, gid)
+        target.chmod(0o640)
+
+
+def verify_editor(port, ca, username, password):
+    status, _ = request(port, ca, "GET", "/flows")
+    if status != 401:
+        raise ValueError("Unauthenticated editor API was not rejected.")
+    for candidate, expected in ((secrets.token_hex(80), 403), (password, 200)):
+        status, data = request(port, ca, "POST", "/auth/token", {
+            "client_id": "node-red-editor", "grant_type": "password",
+            "scope": "*", "username": username, "password": candidate
+        })
+        if status != expected or (expected == 200 and not json.loads(data).get("access_token")):
+            raise ValueError(f"Maintenance authentication verification failed: expected HTTP {expected}, got {status}.")
+        if expected == 200:
+            status, flows = request(port, ca, "GET", "/flows", token=json.loads(data)["access_token"])
+            if status != 200 or not isinstance(json.loads(flows), list):
+                raise ValueError("Authenticated flow read failed.")
+    status, _ = request(port, ca, "GET", "/ui/")
+    if status != 404:
+        raise ValueError("Operator dashboard unexpectedly available.")
+
+
+def install():
+    if os.geteuid() != 0 or not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise ValueError("Run locally with authenticated sudo and an interactive terminal.")
+    os.umask(0o077)
+    model = Path("/proc/device-tree/model").read_text().strip("\0")
+    if not model.startswith(("Raspberry Pi 4 Model B", "Raspberry Pi 5 Model B")) or Path("/dev/piControl0").exists():
+        raise ValueError("Spare Raspberry Pi only; working RevPi excluded.")
+    source = Path(__file__).resolve().parent
+    account = pwd.getpwnam("gatekeeper")
+    settings = ROOT / "settings.js"
+    config = ROOT / "maintenance-editor.json"
+    tls = ROOT / "editor-tls"
+    if config.exists() or config.is_symlink() or tls.exists() or tls.is_symlink():
+        raise ValueError("Existing maintenance editor files require upgrade/recovery review.")
+    protected(settings, 0o640, 0)
+    protected(ROOT / "broker-ca.crt", 0o640, 0)
+    protected(ROOT / "ca" / "ca.key", 0o600, 0)
+    # Accept only the reviewed pre-editor configuration, not a customized setup.
+    reviewed = (source / "settings.js").read_text()
+    headless = reviewed.split("\nconst fs = require('fs');", 1)[0]
+    if settings.read_text().strip() not in (headless.strip(), reviewed.strip()):
+        raise ValueError("Expected matching reviewed headless settings; custom configuration needs review.")
+    flows = Path("/var/lib/gatekeeper/flows.json")
+    protected(flows, 0o600, account.pw_uid)
+    if json.loads(flows.read_text()) != json.loads((source / "foundation-flows.json").read_text()):
+        raise ValueError("Fresh idle foundation required; an existing server must not be overwritten.")
+    run("systemctl", "is-active", "--quiet", "gatekeeper-backend.service")
+    if any("/var/lib/gatekeeper/commissioning.sock" in line and "ESTAB" in line
+           for line in run("ss", "-xH").splitlines()):
+        raise ValueError("Close any HDMI QR display before restarting.")
+    host = json.loads((ROOT / "provisioning.json").read_text())["broker_host"]
+    print("HTTPS maintenance editor: localhost:1880, SSH tunnel only; dashboard stays disabled.")
+    print("Full editor permission can deploy code as gatekeeper. Use a separate trusted maintenance password.")
+    username = input("Separate editor username [maintenance]: ").strip() or "maintenance"
+    password = getpass.getpass("New editor password (12+ characters, maximum 72 UTF-8 bytes): ")
+    validate_fields(username, password)
+    if getpass.getpass("Confirm editor password: ") != password:
+        raise ValueError("Passwords do not match.")
+    if input("Type ENABLE-LOCAL-HTTPS-EDITOR to continue: ").strip() != "ENABLE-LOCAL-HTTPS-EDITOR":
+        raise ValueError("Cancelled.")
+    backup_root = ROOT / "editor-backups"
+    backup_root.mkdir(mode=0o700, exist_ok=True)
+    info = backup_root.lstat()
+    if backup_root.is_symlink() or not backup_root.is_dir() or info.st_uid != 0 or info.st_mode & 0o777 != 0o700:
+        raise ValueError("Unsafe editor backup directory.")
+    backup = backup_root / f"settings-{time.time_ns()}.js"
+    shutil.copyfile(settings, backup)
+    backup.chmod(0o600)
+    touched = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="editor-stage-", dir=ROOT) as temporary:
+            stage = Path(temporary)
+            generate_material(stage, ROOT / "broker-ca.crt", ROOT / "ca" / "ca.key",
+                              host, username, password)
+            run("systemctl", "stop", "gatekeeper-backend.service")
+            touched = True
+            install_material(stage, tls, config, account.pw_gid)
+            shutil.copyfile(source / "settings.js", settings)
+            os.chown(settings, 0, account.pw_gid)
+            settings.chmod(0o640)
+            run("systemctl", "start", "gatekeeper-backend.service")
+            run("systemctl", "is-active", "--quiet", "gatekeeper-backend.service")
+            for attempt in range(20):
+                time.sleep(1)
+                listeners = [line.split()[3] for line in run("ss", "-ltnH").splitlines()
+                             if line.split()[3].endswith(":1880")]
+                if listeners and listeners != ["127.0.0.1:1880"]:
+                    raise ValueError("Editor not restricted to IPv4 loopback.")
+                if listeners:
+                    verify_editor(1880, ROOT / "broker-ca.crt", username, password)
+                    break
+            else:
+                raise ValueError("HTTPS editor did not become ready.")
+            run("systemctl", "is-active", "--quiet", "gatekeeper-backend.service")
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        if touched:
+            print("Editor activation failed; restoring headless settings.", file=sys.stderr)
+            run("systemctl", "stop", "gatekeeper-backend.service")
+            shutil.copyfile(backup, settings)
+            settings.chmod(0o640)
+            if config.exists():
+                config.unlink()
+            if tls.exists():
+                for name in ("server.key", "server.crt"):
+                    (tls / name).unlink(missing_ok=True)
+                tls.rmdir()
+            run("systemctl", "start", "gatekeeper-backend.service")
+            run("systemctl", "is-active", "--quiet", "gatekeeper-backend.service")
+        raise error
+    print(f"HTTPS editor verified: loopback only, protected API/login, no dashboard. Backup: {backup}")
+    print("Forward localhost:1880 over SSH; browse https://localhost:1880 using the public site CA.")
+    print("Flows, MQTT credentials, application users and credentialSecret were preserved.")
+
+
+if __name__ == "__main__":
+    try:
+        if len(sys.argv) != 1:
+            raise ValueError("This locally confirmed editor stage takes no arguments.")
+        install()
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
