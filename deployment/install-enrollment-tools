@@ -1,0 +1,67 @@
+#!/bin/bash
+# Install only commissioning tools; never change flows, credentials or running backend.
+set -euo pipefail
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run with sudo: bash deployment/install-enrollment-tools [--enable-ssh-display]" >&2
+    exit 1
+fi
+if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--enable-ssh-display" ]; }; then
+    echo "Usage: sudo bash deployment/install-enrollment-tools [--enable-ssh-display]" >&2
+    exit 1
+fi
+source_dir="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+target=/opt/gatekeeper-server-tools
+for directory in /opt /usr/local/bin /etc/gatekeeper "$target"; do
+    if [ -L "$directory" ]; then
+        echo "Refusing symlink directory: $directory" >&2
+        exit 1
+    fi
+done
+for dependency in /usr/bin/python3 /usr/bin/qrencode /usr/bin/systemd-run /usr/bin/systemctl; do
+    if [ ! -x "$dependency" ]; then
+        echo "Missing required tool: $dependency" >&2
+        exit 1
+    fi
+done
+for file in gatekeeper-enroll gatekeeper-console enrollment_display.py gatekeeper-enroll-command; do
+    if [ ! -f "$source_dir/scripts/$file" ] || [ -L "$source_dir/scripts/$file" ]; then
+        echo "Missing/unsafe source: $file" >&2
+        exit 1
+    fi
+done
+if [ ! -d /etc/gatekeeper ] || [ ! -S /var/lib/gatekeeper/commissioning.sock ]; then
+    echo "An installed, running GateKeeper backend with local enrollment is required." >&2
+    exit 1
+fi
+if /usr/bin/systemctl list-units --all --no-legend 'gatekeeper-enrollment-display-*' | grep -q .; then
+    echo "An SSH enrollment service still exists. Close it before updating tools." >&2
+    exit 1
+fi
+exec 9>/run/gatekeeper-enrollment.lock
+if ! flock -n 9; then
+    echo "Enrollment display busy; close it before installing." >&2
+    exit 1
+fi
+install -d -o root -g root -m 0755 "$target"
+for file in gatekeeper-enroll gatekeeper-console enrollment_display.py; do
+    if [ -L "$target/$file" ]; then
+        echo "Refusing destination symlink: $file" >&2
+        exit 1
+    fi
+    install -o root -g root -m 0644 "$source_dir/scripts/$file" "$target/$file"
+done
+if [ -L /usr/local/bin/gatekeeper-enroll ] || [ -L /etc/gatekeeper/ssh-enrollment-enabled ]; then
+    echo "Refusing symlink command/policy." >&2
+    exit 1
+fi
+install -o root -g root -m 0755 "$source_dir/scripts/gatekeeper-enroll-command" /usr/local/bin/gatekeeper-enroll
+if [ "${1:-}" = "--enable-ssh-display" ]; then
+    printf 'enabled\n' > /etc/gatekeeper/ssh-enrollment-enabled
+    chown root:root /etc/gatekeeper/ssh-enrollment-enabled
+    chmod 0600 /etc/gatekeeper/ssh-enrollment-enabled
+    echo "SSH-assisted physical-monitor enrollment enabled; sudo remains required."
+fi
+echo "Tools installed. No backend restart, flow change or PLC command."
+echo "Local console: gatekeeper-enroll"
+echo "SSH monitor test: gatekeeper-enroll --ssh-display --display-test --name Display-test"
+echo "SSH enrollment: gatekeeper-enroll --ssh-display"

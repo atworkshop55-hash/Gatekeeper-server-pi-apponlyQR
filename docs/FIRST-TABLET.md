@@ -172,11 +172,71 @@ disconnection and restart acceptance with actuator power isolated and the
 appropriate physical safety arrangements. Enrollment alone does not commission
 an operational gate.
 
+## Optional SSH-assisted display on the physical monitor
+
+This is a **separate, opt-in site permission**, not proof the maintainer is
+physically present. Normal local-console enrollment remains available. The QR
+still appears only on the Pi monitor, never in the SSH terminal or a QR file.
+Use authorized SSH on the site LAN or VPN, not a new internet-facing endpoint.
+
+On an existing working server, install just the reviewed commissioning tools:
+
+```sh
+sudo bash deployment/install-enrollment-tools --enable-ssh-display
+```
+
+Run this from this repository's reviewed clone. It does **not** reinstall the
+server, restart the backend, change flows, disable tablet enrollment in the app,
+or send PLC commands. Root/sudo authorization is still required for every request.
+Fresh installations include the short local command, but do not enable SSH
+issuance by default.
+
+From an interactive SSH session (use `ssh -t` when specifying a remote command):
+
+```sh
+gatekeeper-enroll --ssh-display --status
+gatekeeper-enroll --ssh-display --display-test --name Display-test
+gatekeeper-enroll --ssh-display
+```
+
+The second command shows a harmless test QR for up to 60 seconds; it cannot enroll
+a tablet. Confirm that it appears on the actual monitor, not just that the command
+runs. Any key in SSH or on the local keyboard cancels the display.
+
+The last command asks for the new tablet's name, switches temporarily to an unused
+Linux virtual console, and displays the five-minute single-use enrollment QR.
+Keep SSH connected while the keeper scans using the steps above. On redemption,
+expiry, cancellation, detected HDMI disconnect or console change, the display
+clears and the previous console is restored. Disconnecting SSH requests cancellation;
+an independent systemd runtime limit also bounds the worker if the SSH launcher dies.
+Concurrent local/remote displays are refused. No unattended QR is shown at boot.
+
+Local maintainers can now simply run:
+
+```sh
+gatekeeper-enroll
+```
+
+Disable new SSH requests at any time:
+
+```sh
+sudo rm /etc/gatekeeper/ssh-enrollment-enabled
+```
+
+This does not cancel an already-running display: cancel it in its SSH window,
+press a key at the Pi, or wait for expiry. Local console enrollment is unaffected.
+For failed SSH display requests, the command prints the exact temporary unit name;
+inspect its local journal using that name. These commissioning logs do not include
+the QR payload. Physical-monitor scanning and cleanup must be accepted on the
+actual target; unit tests do not prove the display works.
+
 ## Troubleshooting
 
 | Symptom | Check/action |
 |---|---|
-| "Authenticated HDMI Linux console required, not SSH" | Run at the Pi's physical text console, after login, with sudo. Do not bypass this check. |
+| "Authenticated HDMI Linux console required, not SSH" | Use the physical text console, or the separately enabled `--ssh-display` mode. Normal local mode still rejects SSH. |
+| SSH policy file missing / not enabled | Ask the site administrator to deliberately install/enable the SSH display option above. Local enrollment remains available. |
+| SSH display failed | Inspect the temporary service journal named in the error; check HDMI connection, available Linux VT, `/dev/fb0`, and whether another display is active. |
 | No screen after a headless boot | Confirm the selected HDMI connector, KMS boot settings and reboot; try the configured 720p display. |
 | Framebuffer geometry/error or QR too small | The tool supports arm64 RGB565/32-bit `/dev/fb0` at zero offset and at least three pixels/module. Use the configured 1280x720 console; it fails rather than displaying an unreadable QR. |
 | Backend not ready / socket missing | Check the backend and Mosquitto services. Confirm the first app admin exists. Inspect errors locally; do not publish journals containing credentials. |

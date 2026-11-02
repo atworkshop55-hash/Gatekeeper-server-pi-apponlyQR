@@ -69,6 +69,20 @@ The actual selected Node-RED flow was also exercised with:
   broker hostname, readable full-size QR matrix, one-use redemption, permanent
   device application login and bootstrap cleanup.
 
+Optional SSH-assisted enrollment now has a server-only implementation: a short
+sudo-authorized command starts a bounded systemd worker on a temporary physical
+Linux console, without returning QR credentials to SSH. It is opt-in per site
+and does not change the default local-console or in-app enrollment paths.
+Twenty-eight targeted enrollment/console/installer tests passed, including
+policy rejection, display loss, serialization and disconnect cancellation.
+The operator confirmed the harmless QR appears on the test Pi's physical
+monitor and clears when cancelled through SSH; the original console was
+restored and the backend was not restarted. The final helper was then installed
+and the operator successfully enrolled a real tablet through SSH-assisted
+physical-monitor display, confirming the QR disappeared when scanned.
+Physical disconnect/expiry and other-hardware acceptance remain required; see
+[the SSH enrollment instructions](FIRST-TABLET.md#optional-ssh-assisted-display-on-the-physical-monitor).
+
 These fixtures never write to the real PLC, reconfigure live Ethernet or touch
 the working site's database. Running the test suite is not commissioning.
 

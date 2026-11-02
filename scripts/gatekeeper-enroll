@@ -1,7 +1,8 @@
 #!/usr/bin/python3
-"""Authorized local HDMI enrollment display; bootstrap payload never printed."""
+"""Authorized HDMI enrollment; optional SSH initiation never prints QR credentials."""
 
 import argparse
+import contextlib
 import ctypes
 import fcntl
 import importlib.machinery
@@ -11,6 +12,7 @@ import mmap
 import os
 from pathlib import Path
 import select
+import signal
 import socket
 import sqlite3
 import struct
@@ -19,6 +21,8 @@ import sys
 import termios
 import time
 import tty
+
+from enrollment_display import LOCK, PhysicalDisplay, interrupted, require_enabled, ssh_display
 
 
 def console_module():
@@ -98,7 +102,6 @@ def enrollment_status():
 
 
 def framebuffer_matrix(matrix):
-    require_local_console()
     fd = os.open("/dev/fb0", os.O_RDWR)
     try:
         variable = fcntl.ioctl(fd, 0x4600, bytes(160))
@@ -151,6 +154,10 @@ def framebuffer_matrix(matrix):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--status", action="store_true", help="Read-only account counts and readiness; no credentials.")
+    parser.add_argument("--ssh-display", action="store_true", help="Authorized SSH request; QR appears only on Pi HDMI.")
+    parser.add_argument("--name", help="Tablet name; otherwise prompted.")
+    parser.add_argument("--display-test", action="store_true", help="Display a harmless test QR without issuing credentials.")
+    parser.add_argument("--remote-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
     surface = None
@@ -158,16 +165,53 @@ def main():
     original_terminal = None
     stream = None
     failure = None
+    display = None
+    lock = None
+    handlers = {}
     try:
         if os.geteuid() != 0:
-            raise ValueError("Run the reviewed tool locally with sudo to authorize enrollment and HDMI drawing.")
-        require_local_console()
+            raise ValueError("Run gatekeeper-enroll with sudo authorization.")
+        for event in (signal.SIGTERM, signal.SIGHUP):
+            handlers[event] = signal.signal(event, interrupted)
+        if args.ssh_display or args.remote_worker:
+            require_enabled()
+        else:
+            require_local_console()
+        if args.ssh_display and args.remote_worker:
+            raise ValueError("Conflicting display modes.")
         if args.status:
             print(json.dumps(enrollment_status(), indent=2))
             return 0
-        name = input("Name for the new tablet: ").strip()
+        name = args.name if args.name is not None else input("Name for the new tablet: ")
+        name = name.strip()
         if not name or len(name) > 64 or any(ord(c) < 32 or ord(c) == 127 for c in name):
             raise ValueError("Tablet name must be 1-64 characters without controls.")
+        if args.ssh_display:
+            return ssh_display(Path(__file__).resolve(), name, args.display_test)
+        lock = open(LOCK, "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Enrollment display is busy; close the existing request first.") from None
+        if args.remote_worker:
+            display = PhysicalDisplay()
+            display.__enter__()
+        else:
+            original_terminal = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin)
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        if args.display_test:
+            matrix = console_module().display_test_matrix()
+            surface, saved, _ = framebuffer_matrix(matrix)
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if display:
+                    display.check()
+                readable, _, _ = select.select([display.fd if display else sys.stdin], [], [], 0.25)
+                if readable:
+                    break
+            return 0
         print("Real one-use enrollment: scan in Gate Keeper Connection Settings.")
         print("QR clears on use, expiry, any key or Ctrl+C. Never photograph/share this credential QR.")
         stream = socket.socket(socket.AF_UNIX)
@@ -188,41 +232,47 @@ def main():
         if encoded.returncode:
             raise ValueError("Local enrollment QR encoder failed.")
         matrix = console_module().parse_xpm(encoded.stdout)
-        original_terminal = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin)
-        sys.stdout.write("\033[?25l")
-        sys.stdout.flush()
         surface, saved, geometry = framebuffer_matrix(matrix)
         deadline = min(time.time() + 300, float(result["expiresAt"]) / 1000)
         stream.settimeout(5)
         while time.time() < deadline:
-            readable, _, _ = select.select([stream, sys.stdin], [], [], 0.25)
-            if sys.stdin in readable:
-                sys.stdin.read(1)
+            keyboard = display.fd if display else sys.stdin
+            if display:
+                display.check()
+            readable, _, _ = select.select([stream, keyboard], [], [], 0.25)
+            if keyboard in readable:
+                os.read(display.fd if display else sys.stdin.fileno(), 1)
                 break
             if stream in readable:
                 ended, buffer = read_record(stream, buffer)
                 if ended.get("ended"):
                     break
         return 0
-    except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError) as error:
+    except (OSError, ValueError, KeyError, EOFError, sqlite3.Error, subprocess.SubprocessError) as error:
         failure = f"HDMI enrollment failed: {error}"
         return 2
     except KeyboardInterrupt:
         return 130
     finally:
-        if surface is not None:
-            surface[:len(saved)] = saved
-            surface.close()
-        if original_terminal is not None:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, original_terminal)
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
-        if stream is not None:
-            stream.close()
+        with contextlib.ExitStack() as cleanup:
+            for event, handler in handlers.items():
+                cleanup.callback(signal.signal, event, handler)
+            if lock is not None:
+                cleanup.callback(lock.close)
+            if display is not None and display.control is not None:
+                cleanup.callback(display.__exit__, None, None, None)
+            if original_terminal is not None:
+                cleanup.callback(termios.tcsetattr, sys.stdin, termios.TCSADRAIN, original_terminal)
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+            if stream is not None:
+                cleanup.callback(stream.close)
+            if surface is not None:
+                cleanup.callback(surface.close)
+                cleanup.callback(surface.__setitem__, slice(0, len(saved)), saved)
         if failure:
             print(failure, file=sys.stderr)
-        if not args.status:
+        if not args.status and not args.ssh_display:
             print("Enrollment display closed. Check the app for successful redemption; no gate control was enabled.")
 
 

@@ -24,6 +24,7 @@ EXISTING_PATHS = (
     "/etc/gatekeeper", "/var/lib/gatekeeper", "/var/lib/gatekeeper-management",
     "/var/lib/gatekeeper-control", "/etc/systemd/system/gatekeeper-backend.service",
     "/etc/dnsmasq.d/ot-network.conf",
+    "/usr/local/bin/gatekeeper-enroll",
 )
 FRESH_UNITS = ("nodered.service", "gatekeeper-backend.service", "gatekeeper-control.service",
                "mosquitto.service", "dnsmasq.service", "gatekeeper-network-static.service",
@@ -175,8 +176,11 @@ def install_platform():
     tools = Path("/opt/gatekeeper-server-tools")
     tools.mkdir(mode=0o755)
     tools.chmod(0o755)
-    for name in ("gatekeeper-console", "gatekeeper-enroll", "gatekeeper_plc_read.py"):
+    for name in ("gatekeeper-console", "gatekeeper-enroll", "gatekeeper_plc_read.py",
+                 "enrollment_display.py"):
         install_file(ROOT / "scripts" / name, tools / name)
+    install_file(ROOT / "scripts/gatekeeper-enroll-command",
+                 "/usr/local/bin/gatekeeper-enroll", mode=0o755)
     run("systemctl", "daemon-reload")
     run("systemctl", "enable", "--now", "gatekeeper-network-static.service",
         "gatekeeper-reference-management.service")

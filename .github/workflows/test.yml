@@ -20,4 +20,6 @@ jobs:
       - run: |
           sh -n install.sh
           bash -n deployment/install-backend
+          bash -n deployment/install-enrollment-tools
+          sh -n scripts/gatekeeper-enroll-command
       - run: python3 -B scripts/install-server --plan --host ci-server.local

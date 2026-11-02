@@ -78,7 +78,7 @@ class FreshInstallTests(unittest.TestCase):
     def test_platform_directories_remain_readable_under_private_umask(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("opt", "etc", "etc/systemd/system", "var/lib"):
+            for name in ("opt", "etc", "etc/systemd/system", "var/lib", "usr/local/bin"):
                 (root / name).mkdir(parents=True, exist_ok=True)
 
             def mapped(value):

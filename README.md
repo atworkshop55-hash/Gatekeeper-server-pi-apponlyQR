@@ -10,6 +10,8 @@ The Flutter tablet app is a separate project.
 - SQLite application users, settings, zones, registered gates and audit history.
 - Local-monitor, five-minute, single-use QR enrollment with the site's public CA
   embedded in the QR and permanent per-tablet MQTT identities.
+- Short `gatekeeper-enroll` command and optional sudo-authorized SSH initiation,
+  displaying only on the physical Pi monitor; SSH mode is disabled by default.
 - Mosquitto TLS/Dynamic Security, mapped Pi Ethernet telemetry/discovery, and
   bounded privileged network/management helpers.
 - Optional authenticated HTTPS Node-RED maintenance editor on localhost only.
